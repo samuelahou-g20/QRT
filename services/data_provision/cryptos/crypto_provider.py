@@ -21,94 +21,9 @@ import aiolimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import hashlib
 
-
-@dataclass
-class OHLCVData:
-    """Standardized OHLCV data structure"""
-    timestamp: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    exchange: str
-    symbol: str
-    timeframe: str
-    
-    def to_dict(self) -> Dict:
-        return asdict(self)
-    
-    def validate(self) -> bool:
-        """Basic validation for OHLCV data"""
-        try:
-            # Check for valid OHLC relationships
-            if not (self.low <= self.open <= self.high and 
-                self.low <= self.close <= self.high and
-                self.low <= self.high):
-                return False
-            
-            # Check for reasonable values
-            if any(v < 0 for v in [self.open, self.high, self.low, self.close, self.volume]):
-                return False
-                
-            # Check timestamp is reasonable (not in future, not too old)
-            now = int(datetime.now(timezone.utc) * 1000)
-            # Allow data up to 10 years old instead of just 1 year
-            if self.timestamp > now or self.timestamp < (now - 10 * 365 * 24 * 60 * 60 * 1000):
-                return False
-                
-            return True
-        except Exception:
-            return False
-
-
-class CircuitBreaker:
-    """Simple circuit breaker implementation"""
-    
-    def __init__(self, failure_threshold: int = 5, timeout: int = 60):
-        self.failure_threshold = failure_threshold
-        self.timeout = timeout
-        self.failure_count = 0
-        self.last_failure_time = None
-        self.state = 'closed'  # closed, open, half_open
-    
-    def can_execute(self) -> bool:
-        if self.state == 'closed':
-            return True
-        elif self.state == 'open':
-            if time.time() - self.last_failure_time > self.timeout:
-                self.state = 'half_open'
-                return True
-            return False
-        else:  # half_open
-            return True
-    
-    def record_success(self):
-        self.failure_count = 0
-        self.state = 'closed'
-    
-    def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = time.time()
-        if self.failure_count >= self.failure_threshold:
-            self.state = 'open'
-
-
-class BaseDataProvider(ABC):
-    """Abstract base class for data providers"""
-    
-    @abstractmethod
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, 
-                         since: Optional[int] = None, limit: Optional[int] = None) -> List[OHLCVData]:
-        pass
-    
-    @abstractmethod
-    async def get_markets(self) -> Dict[str, Any]:
-        pass
-    
-    @abstractmethod
-    async def close(self):
-        pass
+from services.data_provision.base_provider import BaseDataProvider
+from services.data_provision.circuit_breaker import CircuitBreaker
+from services.data_provision.ohlcv_data import OHLCVData
 
 
 class CryptoProvider(BaseDataProvider):
@@ -127,6 +42,7 @@ class CryptoProvider(BaseDataProvider):
         'bybit': {'ratelimit': 600, 'sandbox': False},
     }
     
+
     def __init__(self, 
                  exchanges: List[str] = None,
                  data_dir: str = "data/cryptos",
@@ -184,6 +100,7 @@ class CryptoProvider(BaseDataProvider):
         # Initialize exchanges
         self._initialize_exchanges()
     
+
     def _initialize_exchanges(self):
         """Initialize exchange instances with rate limiters and circuit breakers"""
         for exchange_name in self.exchanges:
@@ -221,6 +138,7 @@ class CryptoProvider(BaseDataProvider):
             except Exception as e:
                 self.logger.error(f"Failed to initialize {exchange_name}: {e}")
     
+
     def _convert_symbol(self, symbol: str, exchange_name: str, to_exchange: bool = True) -> str:
         """
         Convert symbol between unified and exchange format if symbol mapping is enabled
@@ -247,72 +165,175 @@ class CryptoProvider(BaseDataProvider):
         except Exception as e:
             self.logger.debug(f"Symbol conversion failed for {symbol} on {exchange_name}: {e}")
             return symbol
-    
+
+
+    def _is_valid_ohlcv(self, candle: List) -> bool:
+        """Helper to validate a single candle."""
+        try:
+            data = OHLCVData(
+                timestamp=int(candle[0]), open=float(candle[1]), high=float(candle[2]),
+                low=float(candle[3]), close=float(candle[4]), volume=float(candle[5]),
+                exchange='', symbol='', interval=''
+            )
+            return data.validate()
+        except (ValueError, IndexError):
+            return False
+
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=4, max=10),
         retry=retry_if_exception_type((ccxt.NetworkError, ccxt.ExchangeNotAvailable))
     )
-    async def _fetch_exchange_ohlcv(self, 
-                                   exchange: ccxt_async.Exchange,
-                                   exchange_name: str,
-                                   symbol: str, 
-                                   timeframe: str,
-                                   since: Optional[int] = None,
-                                   limit: Optional[int] = None) -> List[OHLCVData]:
+    async def _fetch_symbol_from_exchange(self, 
+        exchange: ccxt_async.Exchange, 
+        exchange_name: str, 
+        symbol: str, 
+        interval: str, 
+        start_date: Union[pd.Timestamp, datetime], 
+        end_date: Union[pd.Timestamp, datetime]
+    ) -> List[OHLCVData]:
         """
-        Fetch OHLCV data from a specific exchange with error handling
+        Fetch OHLCV data for a single symbol from a specific exchange.
         """
-        circuit_breaker = self.circuit_breakers[exchange_name]
-        
-        if not circuit_breaker.can_execute():
-            raise ccxt.ExchangeNotAvailable(f"{exchange_name} circuit breaker is open")
-        
-        try:
-            # Convert symbol if mapping is enabled
-            exchange_symbol = self._convert_symbol(symbol, exchange_name, to_exchange=True)
-            
-            if exchange_symbol != symbol:
-                self.logger.debug(f"Converted {symbol} to {exchange_symbol} for {exchange_name}")
-            
-            # Apply rate limiting
-            async with self.rate_limiters[exchange_name]:
-                raw_data = await exchange.fetch_ohlcv(
-                    symbol=exchange_symbol,
-                    timeframe=timeframe,
-                    since=since,
-                    limit=limit
-                )
-            
-            # Convert to standardized format
-            ohlcv_data = []
-            for candle in raw_data:
-                data = OHLCVData(
-                    timestamp=int(candle[0]),
-                    open=float(candle[1]),
-                    high=float(candle[2]),
-                    low=float(candle[3]),
-                    close=float(candle[4]),
-                    volume=float(candle[5]),
-                    exchange=exchange_name,
-                    symbol=symbol,  # Store original/unified symbol
-                    timeframe=timeframe
-                )
+        since = int(start_date.timestamp() * 1000)
+        limit = 1000  # Default limit per request
+        all_ohlcv = []
+
+        while since < end_date.timestamp() * 1000:
+            circuit_breaker = self.circuit_breakers[exchange_name]
+            if not circuit_breaker.can_execute():
+                self.logger.warning(f"{exchange_name} circuit breaker is open for {symbol}")
+                break
+
+            try:
+                exchange_symbol = self._convert_symbol(symbol, exchange_name, to_exchange=True)
                 
-                # Validate data
-                if data.validate():
-                    ohlcv_data.append(data)
-                else:
-                    self.logger.warning(f"Invalid OHLCV data from {exchange_name}: {data}")
-            
-            circuit_breaker.record_success()
-            return ohlcv_data
-            
-        except Exception as e:
-            circuit_breaker.record_failure()
-            self.logger.error(f"Error fetching from {exchange_name}: {e}")
-            raise
+                async with self.rate_limiters[exchange_name]:
+                    raw_data = await exchange.fetch_ohlcv(exchange_symbol, interval, since, limit)
+
+                if not raw_data:
+                    break
+
+                ohlcv_data = [
+                    OHLCVData(
+                        timestamp=int(c[0]), open=float(c[1]), high=float(c[2]),
+                        low=float(c[3]), close=float(c[4]), volume=float(c[5]),
+                        exchange=exchange_name, symbol=symbol, interval=interval
+                    ) for c in raw_data if self._is_valid_ohlcv(c)
+                ]
+                
+                all_ohlcv.extend(ohlcv_data)
+                since = raw_data[-1][0] + exchange.parse_timeframe(interval) * 1000
+                circuit_breaker.record_success()
+
+            except Exception as e:
+                circuit_breaker.record_failure()
+                self.logger.error(f"Error fetching from {exchange_name} for {symbol}: {e}")
+                break
+        
+        return all_ohlcv
+
+
+    def _get_file_path(self, symbol: str, date: datetime, exchange: str, 
+                      interval: str, data_type: str = 'ohlcv') -> Path:
+        """Generate file path for storing data"""
+        # Clean symbol for filename
+        clean_symbol = symbol.replace('/', '_').replace('-', '_')
+        
+        path = (self.data_dir / 
+                f"{data_type}" /
+                f"{exchange}" /
+                f"{clean_symbol}" /
+                f"year={date.year}" /
+                f"month={date.month:02d}" /
+                f"day={date.day:02d}")
+        
+        path.mkdir(parents=True, exist_ok=True)
+        
+        filename = f"{interval}.parquet"
+        return path / filename
+
+
+    async def _load_symbol_from_parquet(self, symbol: str, start_date: datetime, end_date: datetime, interval: str) -> pd.DataFrame:
+        """Loads data for a single symbol from local Parquet files within a date range."""
+        all_dfs = []
+        clean_symbol = symbol.replace('/', '_').replace('-', '_')
+
+        date_range = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
+
+        for exchange_name in self.exchanges:
+            for date in date_range:
+                file_path = self._get_file_path(symbol, date, exchange_name, interval)
+                if file_path.exists():
+                    try:
+                        df = pd.read_parquet(file_path)
+                        all_dfs.append(df)
+                    except Exception as e:
+                        self.logger.error(f"Error loading Parquet file {file_path}: {e}")
+        
+        if not all_dfs:
+            return pd.DataFrame()
+
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df['datetime'] = pd.to_datetime(combined_df['timestamp'], unit='ms', utc=True)
+        
+        combined_df = combined_df.set_index('datetime')
+        mask = (combined_df.index >= start_date) & (combined_df.index <= end_date)
+        filtered_df = combined_df.loc[mask]
+        
+        # Drop duplicates across exchanges for the same timestamp, keeping the first entry
+        final_df = filtered_df[~filtered_df.index.duplicated(keep='first')]
+        return final_df.sort_index()
+
+
+    async def save_to_parquet(self,
+                        data: Dict[str, List[OHLCVData]],
+                        symbol: str,
+                        timeframe: str,
+                        date: Optional[datetime] = None):
+        """Save OHLCV data to parquet files"""
+        if not date:
+            date = datetime.now()
+
+        for exchange_name, ohlcv_list in data.items():
+            if not ohlcv_list:
+                continue
+
+            # Convert to DataFrame
+            df_data = [d.to_dict() for d in ohlcv_list]
+            df = pd.DataFrame(df_data)
+
+            if df.empty:
+                continue
+
+            # Convert timestamp to datetime
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+
+            # Sort by timestamp
+            df = df.sort_values('timestamp')
+
+            # Remove duplicates
+            df = df.drop_duplicates(subset=['timestamp'], keep='last')
+
+            # *** FIX: Select only the columns you want to save ***
+            columns_to_save = [
+                'timestamp', 'open', 'high', 'low', 'close', 'volume', 'datetime'
+            ]
+            df_to_save = df[columns_to_save]
+
+
+            # Get file path
+            file_path = self._get_file_path(symbol, date, exchange_name, timeframe)
+
+            try:
+                # Save to parquet with compression
+                df_to_save.to_parquet(file_path, compression='snappy', index=False)
+                self.logger.info(f"Saved {len(df_to_save)} records to {file_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to save data to {file_path}: {e}")
     
+
     async def get_available_symbols(self, exchange: str, force_refresh: bool = False) -> Set[str]:
         """
         Get available symbols for an exchange. Returns unified symbols if mapping is enabled.
@@ -372,109 +393,30 @@ class CryptoProvider(BaseDataProvider):
             self.logger.error(f"Failed to get symbols from {exchange}: {e}")
             return set()
     
-    async def find_common_symbols(self, min_exchanges: int = 2) -> Dict[str, List[str]]:
-        """
-        Find symbols available on multiple exchanges (useful for arbitrage).
-        Returns unified symbols if mapping is enabled.
-        
-        Args:
-            min_exchanges: Minimum number of exchanges a symbol must be on
-            
-        Returns:
-            Dict mapping symbols to list of exchanges that support them
-        """
-        # Get symbols from all exchanges
-        all_symbols: Dict[str, Set[str]] = {}
-        
-        tasks = []
-        for exchange in self.exchange_instances.keys():
-            tasks.append(self.get_available_symbols(exchange))
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for exchange, result in zip(self.exchange_instances.keys(), results):
-            if isinstance(result, set):
-                all_symbols[exchange] = result
-            else:
-                self.logger.error(f"Failed to get symbols from {exchange}: {result}")
-                all_symbols[exchange] = set()
-        
-        # Find common symbols
-        symbol_exchanges: Dict[str, List[str]] = {}
-        
-        # Collect all unique symbols
-        all_unique_symbols = set()
-        for symbols in all_symbols.values():
-            all_unique_symbols.update(symbols)
-        
-        # Check which exchanges have each symbol
-        for symbol in all_unique_symbols:
-            exchanges_with_symbol = []
-            for exchange, symbols in all_symbols.items():
-                if symbol in symbols:
-                    exchanges_with_symbol.append(exchange)
-            
-            if len(exchanges_with_symbol) >= min_exchanges:
-                symbol_exchanges[symbol] = exchanges_with_symbol
-        
-        return symbol_exchanges
     
-    async def fetch_ohlcv(self, 
-                         symbol: str, 
-                         timeframe: str = '1m',
-                         since: Optional[int] = None, 
-                         limit: Optional[int] = None,
-                         exchanges: Optional[List[str]] = None,
-                         validate_availability: bool = False) -> Dict[str, List[OHLCVData]]:
-        """
-        Fetch OHLCV data from multiple exchanges
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get health status of all exchanges"""
+        status = {
+            'exchanges': {},
+            'overall_healthy': True,
+            'symbol_mapping_enabled': self.use_symbol_mapping
+        }
         
-        Args:
-            symbol: Trading symbol (unified format if mapping enabled, e.g., 'BTC/USDT')
-            timeframe: Timeframe (1m, 5m, 1h, 1d, etc.)
-            since: Timestamp in milliseconds
-            limit: Number of candles to fetch
-            exchanges: Specific exchanges to query
-            validate_availability: Check if symbol is available before fetching (only with mapping)
+        for exchange_name in self.exchange_instances.keys():
+            circuit_breaker = self.circuit_breakers[exchange_name]
+            exchange_status = {
+                'circuit_breaker_state': circuit_breaker.state,
+                'failure_count': circuit_breaker.failure_count,
+                'healthy': circuit_breaker.state == 'closed'
+            }
+            status['exchanges'][exchange_name] = exchange_status
             
-        Returns:
-            Dict mapping exchange names to OHLCV data lists
-        """
-        target_exchanges = exchanges or list(self.exchange_instances.keys())
-        results = {}
+            if not exchange_status['healthy']:
+                status['overall_healthy'] = False
         
-        # Optionally validate symbol availability (only works with symbol mapping)
-        if validate_availability and self.use_symbol_mapping:
-            valid_exchanges = []
-            for exchange_name in target_exchanges:
-                available = await self.get_available_symbols(exchange_name)
-                if symbol in available:
-                    valid_exchanges.append(exchange_name)
-                else:
-                    self.logger.warning(f"{symbol} not available on {exchange_name}")
-            target_exchanges = valid_exchanges
-        
-        tasks = []
-        for exchange_name in target_exchanges:
-            if exchange_name in self.exchange_instances:
-                exchange = self.exchange_instances[exchange_name]
-                task = self._fetch_exchange_ohlcv(
-                    exchange, exchange_name, symbol, timeframe, since, limit
-                )
-                tasks.append((exchange_name, task))
-        
-        # Execute all requests concurrently
-        for exchange_name, task in tasks:
-            try:
-                data = await task
-                results[exchange_name] = data
-                self.logger.info(f"Fetched {len(data)} candles from {exchange_name}")
-            except Exception as e:
-                self.logger.error(f"Failed to fetch from {exchange_name}: {e}")
-                results[exchange_name] = []
-        
-        return results
-    
+        return status
+
+
     async def get_markets(self, exchange_name: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """
         Get available markets from exchanges.
@@ -510,123 +452,71 @@ class CryptoProvider(BaseDataProvider):
                     markets[name] = {}
         
         return markets
-    
-    def _get_file_path(self, symbol: str, date: datetime, exchange: str, 
-                      timeframe: str, data_type: str = 'ohlcv') -> Path:
-        """Generate file path for storing data"""
-        # Clean symbol for filename
-        clean_symbol = symbol.replace('/', '_').replace('-', '_')
-        
-        path = (self.data_dir / 
-                f"{data_type}" /
-                f"{exchange}" /
-                f"{clean_symbol}" /
-                f"year={date.year}" /
-                f"month={date.month:02d}" /
-                f"day={date.day:02d}")
-        
-        path.mkdir(parents=True, exist_ok=True)
-        
-        filename = f"{timeframe}_{data_type}.parquet"
-        return path / filename
-    
-    async def save_to_parquet(self, 
-                            data: Dict[str, List[OHLCVData]], 
-                            symbol: str, 
-                            timeframe: str,
-                            date: Optional[datetime] = None):
-        """Save OHLCV data to parquet files"""
-        if not date:
-            date = datetime.now()
-        
-        for exchange_name, ohlcv_list in data.items():
-            if not ohlcv_list:
-                continue
-            
-            # Convert to DataFrame
-            df_data = [data.to_dict() for data in ohlcv_list]
-            df = pd.DataFrame(df_data)
-            
-            if df.empty:
-                continue
-            
-            # Convert timestamp to datetime
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
 
-            if not date:
-                date = datetime.now(timezone.utc)
-            
-            # Sort by timestamp
-            df = df.sort_values('timestamp')
-            
-            # Remove duplicates
-            df = df.drop_duplicates(subset=['timestamp'], keep='last')
-            
-            # Get file path
-            file_path = self._get_file_path(symbol, date, exchange_name, timeframe)
-            
-            try:
-                # Save to parquet with compression
-                df.to_parquet(file_path, compression='snappy', index=False)
-                self.logger.info(f"Saved {len(df)} records to {file_path}")
-            except Exception as e:
-                self.logger.error(f"Failed to save data to {file_path}: {e}")
-    
-    async def fetch_and_store(self, 
-                            symbols: List[str], 
-                            timeframe: str = '1m',
-                            days_back: int = 1) -> None:
+
+    async def fetch_ohlcv(self, 
+        symbols: Union[str, List[str]], 
+        start_date: Union[pd.Timestamp, datetime], 
+        end_date: Union[pd.Timestamp, datetime], 
+        interval: str,
+        force_reload: bool = False
+    ) -> Dict[str, pd.DataFrame]:
         """
-        Fetch data for multiple symbols and store to parquet files
-        
+        Fetch OHLCV data from multiple exchanges for multiple symbols.
+
         Args:
-            symbols: List of symbols to fetch (unified format if mapping enabled)
-            timeframe: Timeframe to fetch
-            days_back: Number of days of historical data to fetch
+            symbols: A symbol or list of symbols to fetch.
+            start_date: The start date for the data.
+            end_date: The end date for the data.
+            interval: The frequency of the data (e.g., '1m', '1h', '1d').
+            force_reload: If True, bypasses local cache and fetches from the exchange.
+
+        Returns:
+            A dictionary where keys are symbols and values are pandas DataFrames
+            with the OHLCV data for that symbol.
         """
-        since = int((datetime.now(timezone.utc) - timedelta(days=days_back)).timestamp() * 1000)
-        
+        if isinstance(symbols, str):
+            symbols = [symbols]
+
+        results: Dict[str, pd.DataFrame] = {}
+
         for symbol in symbols:
-            try:
-                self.logger.info(f"Fetching {symbol} data...")
-                data = await self.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    since=since,
-                    limit=1000,
-                    validate_availability=self.use_symbol_mapping
-                )
-                
-                await self.save_to_parquet(data, symbol, timeframe)
-                
-            except Exception as e:
-                self.logger.error(f"Failed to process {symbol}: {e}")
+            # 1. Try to load from local storage first if not forcing reload
+            if not force_reload:
+                local_df = await self._load_symbol_from_parquet(symbol, start_date, end_date, interval)
+                if not local_df.empty:
+                    self.logger.info(f"Loaded {len(local_df)} records for {symbol} from local Parquet files.")
+                    results[symbol] = local_df
+                    continue
+
+            # 2. If no local data or force_reload is True, fetch from exchanges
+            self.logger.info(f"Fetching {symbol} from exchanges (force_reload={force_reload}).")
+            symbol_data = []
+            tasks = []
+            for exchange_name, exchange in self.exchange_instances.items():
+                tasks.append(self._fetch_symbol_from_exchange(exchange, exchange_name, symbol, interval, start_date, end_date))
             
-            # Small delay between symbols to be respectful
-            await asyncio.sleep(0.1)
-    
-    def get_health_status(self) -> Dict[str, Any]:
-        """Get health status of all exchanges"""
-        status = {
-            'exchanges': {},
-            'overall_healthy': True,
-            'symbol_mapping_enabled': self.use_symbol_mapping
-        }
-        
-        for exchange_name in self.exchange_instances.keys():
-            circuit_breaker = self.circuit_breakers[exchange_name]
-            exchange_status = {
-                'circuit_breaker_state': circuit_breaker.state,
-                'failure_count': circuit_breaker.failure_count,
-                'healthy': circuit_breaker.state == 'closed'
-            }
-            status['exchanges'][exchange_name] = exchange_status
+            exchange_results = await asyncio.gather(*tasks)
+            for data in exchange_results:
+                symbol_data.extend(data)
+
+            if not symbol_data:
+                results[symbol] = pd.DataFrame()
+                continue
+
+            df = pd.DataFrame([d.to_dict() for d in symbol_data])
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df = df.drop_duplicates(subset=['timestamp', 'exchange']).set_index('datetime')
+            df_sorted = df.sort_index()
             
-            if not exchange_status['healthy']:
-                status['overall_healthy'] = False
+            # Save the newly fetched data
+            await self.save_to_parquet(df_sorted)
+            
+            results[symbol] = df_sorted
         
-        return status
+        return results
     
+
     async def close(self):
         """Close all exchange connections"""
         # Save symbol configuration if using symbol mapping
@@ -645,7 +535,7 @@ class CryptoProvider(BaseDataProvider):
 
 
 # Example usage and utility functions
-async def main():
+async def example():
     """Example usage of the CryptoProvider with and without symbol mapping"""
     # Setup logging
     logging.basicConfig(
@@ -667,12 +557,18 @@ async def main():
     try:
         # Must use exchange-specific format
         symbols = ['BTCUSDT']  # Binance format
-        await provider_traditional.fetch_and_store(
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=1)
+        data_dict = await provider_traditional.fetch_ohlcv(
             symbols=symbols,
-            timeframe='1h',
-            days_back=1
+            start_date=start_date,
+            end_date=end_date,
+            interval='1h'
         )
         print(f"Traditional mode: Fetched data for {symbols}")
+        for symbol, df in data_dict.items():
+            print(f"\n--- Data for {symbol} ---")
+            print(df.head())
     finally:
         await provider_traditional.close()
     
@@ -692,18 +588,18 @@ async def main():
         symbols = ['BTC/USDT', 'ETH/USDT']  # Unified format
         
         print(f"\nFetching {symbols} from all exchanges using unified format...")
-        await provider_unified.fetch_and_store(
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=1)
+        data_dict = await provider_unified.fetch_ohlcv(
             symbols=symbols,
-            timeframe='1h',
-            days_back=1
+            start_date=start_date,
+            end_date=end_date,
+            interval='1h'
         )
         print(f"Unified mode: Fetched data for {symbols}")
-        
-        # Find arbitrage opportunities
-        print("\nFinding symbols available on multiple exchanges...")
-        common = await provider_unified.find_common_symbols(min_exchanges=2)
-        for symbol, exchanges in list(common.items())[:3]:
-            print(f"  {symbol}: {', '.join(exchanges)}")
+        for symbol, df in data_dict.items():
+            print(f"\n--- Data for {symbol} ---")
+            print(df.head())
         
         # Check health status
         health = provider_unified.get_health_status()
@@ -715,4 +611,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(example())
+
