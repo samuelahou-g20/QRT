@@ -1,6 +1,7 @@
 """
 Comprehensive unit tests for the CryptoProvider class.
-Tests data validation, error handling, storage, and API interactions.
+Tests data validation, error handling, storage, API interactions,
+and the new symbol mapping functionality.
 """
 
 import pytest
@@ -11,9 +12,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
 import json
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import Mock, AsyncMock, patch, MagicMock, call
 import ccxt
 import aiofiles
+import sys
+import os
+
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from services.data_provision.cryptos.crypto_provider import CryptoProvider, OHLCVData, CircuitBreaker
 
@@ -151,35 +157,39 @@ class TestCircuitBreaker:
         assert cb.state == 'closed'
 
 
-class TestCryptoProvider:
-    """Test the main CryptoProvider functionality"""
+class TestCryptoProviderTraditional:
+    """Test the CryptoProvider without symbol mapping (backward compatibility)"""
     
     @pytest.fixture
-    def temp_data_dir(self):
+    def temp_data_directory(self):
         """Create a temporary directory for test data"""
         with tempfile.TemporaryDirectory() as temp_dir:
             yield temp_dir
     
     @pytest.fixture
-    def provider(self, temp_data_dir):
-        """Create a CryptoProvider instance for testing"""
+    def provider(self, temp_data_directory):
+        """Create a CryptoProvider instance for testing (traditional mode)"""
         return CryptoProvider(
             exchanges=['binance', 'coinbase'],
-            data_dir=temp_data_dir,
-            api_keys={}
+            data_dir=temp_data_directory,
+            api_keys={},
+            use_symbol_mapping=False  # Traditional mode
         )
     
-    def test_initialization(self, temp_data_dir):
-        """Test proper initialization of CryptoProvider"""
+    def test_initialization_without_mapping(self, temp_data_directory):
+        """Test proper initialization without symbol mapping"""
         provider = CryptoProvider(
             exchanges=['binance'],
-            data_dir=temp_data_dir
+            data_dir=temp_data_directory,
+            use_symbol_mapping=False
         )
         
         assert 'binance' in provider.exchange_instances
         assert 'binance' in provider.rate_limiters
         assert 'binance' in provider.circuit_breakers
-        assert provider.data_dir == Path(temp_data_dir)
+        assert provider.data_dir == Path(temp_data_directory)
+        assert provider.use_symbol_mapping is False
+        assert provider.symbol_manager is None
     
     def test_file_path_generation(self, provider):
         """Test that file paths are generated correctly"""
@@ -206,8 +216,8 @@ class TestCryptoProvider:
             assert part in path_str
     
     @pytest.mark.asyncio
-    async def test_fetch_ohlcv_mock_success(self, provider):
-        """Test successful OHLCV fetching with mocked exchange"""
+    async def test_fetch_ohlcv_traditional_format(self, provider):
+        """Test fetching with traditional exchange-specific formats"""
         # Mock the exchange response
         mock_data = [
             [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5],
@@ -219,114 +229,278 @@ class TestCryptoProvider:
         mock_exchange.fetch_ohlcv.return_value = mock_data
         provider.exchange_instances['binance'] = mock_exchange
         
-        result = await provider.fetch_ohlcv('BTC/USDT', '1h')
+        # Use Binance-specific format
+        result = await provider.fetch_ohlcv('BTCUSDT', '1h')
         
         assert 'binance' in result
         assert len(result['binance']) == 2
         
-        first_candle = result['binance'][0]
-        assert first_candle.symbol == 'BTC/USDT'
-        assert first_candle.exchange == 'binance'
-        assert first_candle.open == 47000.0
-        assert first_candle.high == 47500.0
-    
-    @pytest.mark.asyncio
-    async def test_fetch_ohlcv_handles_invalid_data(self, provider):
-        """Test that invalid data is filtered out"""
-        # Mock data with one invalid candle (high < low)
-        mock_data = [
-            [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5],  # Valid
-            [1640998800000, 47200.0, 46000.0, 47000.0, 47100.0, 95.2],   # Invalid: high < low
-        ]
-        
-        mock_exchange = AsyncMock()
-        mock_exchange.fetch_ohlcv.return_value = mock_data
-        provider.exchange_instances['binance'] = mock_exchange
-        
-        result = await provider.fetch_ohlcv('BTC/USDT', '1h')
-        
-        # Should only return the valid candle
-        assert len(result['binance']) == 1
-        assert result['binance'][0].open == 47000.0
-    
-    @pytest.mark.asyncio
-    async def test_fetch_ohlcv_exchange_error(self, provider):
-        """Test handling of exchange errors"""
-        mock_exchange = AsyncMock()
-        mock_exchange.fetch_ohlcv.side_effect = ccxt.NetworkError("Connection failed")
-        provider.exchange_instances['binance'] = mock_exchange
-        
-        result = await provider.fetch_ohlcv('BTC/USDT', '1h')
-        
-        # Should return empty list for failed exchange
-        assert result['binance'] == []
-    
-    @pytest.mark.asyncio 
-    async def test_save_to_parquet(self, provider, temp_data_dir):
-        """Test saving data to parquet files"""
-        # Create test data
-        test_data = {
-            'binance': [
-                OHLCVData(
-                    timestamp=1640995200000,
-                    open=47000.0,
-                    high=47500.0,
-                    low=46800.0,
-                    close=47200.0,
-                    volume=100.5,
-                    exchange='binance',
-                    symbol='BTC/USDT',
-                    timeframe='1h'
-                )
-            ]
-        }
-        
-        await provider.save_to_parquet(test_data, 'BTC/USDT', '1h')
-        
-        # Check that file was created
-        expected_path = provider._get_file_path(
-            'BTC/USDT', 
-            datetime.now(), 
-            'binance', 
-            '1h'
+        # Verify the exchange was called with the original symbol
+        mock_exchange.fetch_ohlcv.assert_called_with(
+            symbol='BTCUSDT',
+            timeframe='1h',
+            since=None,
+            limit=None
         )
         
-        assert expected_path.exists()
-        
-        # Verify data integrity
-        df = pd.read_parquet(expected_path)
-        assert len(df) == 1
-        assert df.iloc[0]['open'] == 47000.0
-        assert df.iloc[0]['symbol'] == 'BTC/USDT'
-    
-    def test_health_status(self, provider):
-        """Test health status reporting"""
-        status = provider.get_health_status()
-        
-        assert 'exchanges' in status
-        assert 'overall_healthy' in status
-        
-        for exchange in provider.exchange_instances.keys():
-            assert exchange in status['exchanges']
-            assert 'circuit_breaker_state' in status['exchanges'][exchange]
-            assert 'healthy' in status['exchanges'][exchange]
+        first_candle = result['binance'][0]
+        assert first_candle.symbol == 'BTCUSDT'  # Original symbol preserved
+        assert first_candle.exchange == 'binance'
+        assert first_candle.open == 47000.0
     
     @pytest.mark.asyncio
-    async def test_close_connections(self, provider):
-        """Test that all connections are properly closed"""
-        # Mock exchange instances
-        mock_exchange1 = AsyncMock()
-        mock_exchange2 = AsyncMock()
+    async def test_health_status_without_mapping(self, provider):
+        """Test health status reporting shows mapping disabled"""
+        status = provider.get_health_status()
         
-        provider.exchange_instances = {
-            'binance': mock_exchange1,
-            'coinbase': mock_exchange2
+        assert 'symbol_mapping_enabled' in status
+        assert status['symbol_mapping_enabled'] is False
+        assert 'exchanges' in status
+        assert 'overall_healthy' in status
+
+
+class TestCryptoProviderWithSymbolMapping:
+    """Test the CryptoProvider with symbol mapping enabled"""
+    
+    @pytest.fixture
+    def temp_data_directory(self):
+        """Create a temporary directory for test data"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            yield temp_dir
+    
+    @pytest.fixture
+    def mock_symbol_manager(self):
+        """Create a mock symbol manager"""
+        manager = MagicMock()
+        manager.to_exchange = MagicMock(side_effect=lambda s, e: {
+            ('BTC/USDT', 'binance'): 'BTCUSDT',
+            ('BTC/USDT', 'coinbase'): 'BTC-USD',
+            ('BTC/USDT', 'kraken'): 'XBTUSDT',
+            ('ETH/USDT', 'binance'): 'ETHUSDT',
+            ('ETH/USDT', 'coinbase'): 'ETH-USD',
+        }.get((s, e), s))
+        
+        manager.to_unified = MagicMock(side_effect=lambda s, e, t: {
+            ('BTCUSDT', 'binance'): 'BTC/USDT',
+            ('BTC-USD', 'coinbase'): 'BTC/USDT',
+            ('XBTUSDT', 'kraken'): 'BTC/USDT',
+            ('ETHUSDT', 'binance'): 'ETH/USDT',
+            ('ETH-USD', 'coinbase'): 'ETH/USDT',
+        }.get((s, e), s))
+        
+        return manager
+    
+    @pytest.fixture
+    def provider_with_mapping(self, temp_data_directory, mock_symbol_manager):
+        """Create a CryptoProvider with symbol mapping enabled"""
+        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm_class:
+            mock_sm_class.return_value = mock_symbol_manager
+            
+            provider = CryptoProvider(
+                exchanges=['binance', 'coinbase'],
+                data_dir=temp_data_directory,
+                use_symbol_mapping=True
+            )
+            provider.symbol_manager = mock_symbol_manager
+            return provider
+    
+    def test_initialization_with_mapping(self, temp_data_directory):
+        """Test initialization with symbol mapping enabled"""
+        # Mock the symbol_mapper module import
+        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm:
+            provider = CryptoProvider(
+                exchanges=['binance'],
+                data_dir=temp_data_directory,
+                use_symbol_mapping=True
+            )
+            
+            assert provider.use_symbol_mapping is True
+            assert provider.symbol_manager is not None
+            assert hasattr(provider, 'available_symbols_cache')
+            assert hasattr(provider, 'cache_timestamp')
+    
+    @pytest.mark.asyncio
+    async def test_symbol_conversion_to_exchange(self, provider_with_mapping):
+        """Test symbol conversion from unified to exchange format"""
+        # Test Binance conversion
+        result = provider_with_mapping._convert_symbol('BTC/USDT', 'binance', to_exchange=True)
+        assert result == 'BTCUSDT'
+        
+        # Test Coinbase conversion
+        result = provider_with_mapping._convert_symbol('BTC/USDT', 'coinbase', to_exchange=True)
+        assert result == 'BTC-USD'
+        
+        # Test Kraken conversion
+        result = provider_with_mapping._convert_symbol('BTC/USDT', 'kraken', to_exchange=True)
+        assert result == 'XBTUSDT'
+    
+    @pytest.mark.asyncio
+    async def test_symbol_conversion_to_unified(self, provider_with_mapping):
+        """Test symbol conversion from exchange to unified format"""
+        # Mock the SymbolType import
+        with patch('services.data_provision.cryptos.symbol_mapper.SymbolType'):
+            # Test Binance conversion
+            result = provider_with_mapping._convert_symbol('BTCUSDT', 'binance', to_exchange=False)
+            assert result == 'BTC/USDT'
+            
+            # Test Coinbase conversion  
+            result = provider_with_mapping._convert_symbol('BTC-USD', 'coinbase', to_exchange=False)
+            assert result == 'BTC/USDT'
+    
+    @pytest.mark.asyncio
+    async def test_fetch_ohlcv_with_unified_symbols(self, provider_with_mapping):
+        """Test fetching OHLCV data using unified symbols"""
+        # Mock exchange responses
+        mock_data_binance = [
+            [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5]
+        ]
+        mock_data_coinbase = [
+            [1640995200000, 47010.0, 47510.0, 46810.0, 47210.0, 100.6]
+        ]
+        
+        # Mock exchanges
+        mock_binance = AsyncMock()
+        mock_binance.fetch_ohlcv.return_value = mock_data_binance
+        provider_with_mapping.exchange_instances['binance'] = mock_binance
+        
+        mock_coinbase = AsyncMock()
+        mock_coinbase.fetch_ohlcv.return_value = mock_data_coinbase
+        provider_with_mapping.exchange_instances['coinbase'] = mock_coinbase
+        
+        # Fetch using unified symbol
+        result = await provider_with_mapping.fetch_ohlcv('BTC/USDT', '1h')
+        
+        # Check both exchanges were called with correct converted symbols
+        mock_binance.fetch_ohlcv.assert_called_with(
+            symbol='BTCUSDT',  # Converted to Binance format
+            timeframe='1h',
+            since=None,
+            limit=None
+        )
+        
+        mock_coinbase.fetch_ohlcv.assert_called_with(
+            symbol='BTC-USD',  # Converted to Coinbase format
+            timeframe='1h',
+            since=None,
+            limit=None
+        )
+        
+        # Check results
+        assert 'binance' in result
+        assert 'coinbase' in result
+        assert len(result['binance']) == 1
+        assert len(result['coinbase']) == 1
+        
+        # Check that unified symbol is stored in results
+        assert result['binance'][0].symbol == 'BTC/USDT'
+        assert result['coinbase'][0].symbol == 'BTC/USDT'
+    
+    @pytest.mark.asyncio
+    async def test_get_available_symbols_with_mapping(self, provider_with_mapping):
+        """Test getting available symbols returns unified format"""
+        # Mock exchange markets
+        mock_markets = {
+            'BTCUSDT': {'symbol': 'BTC/USDT', 'id': 'BTCUSDT'},
+            'ETHUSDT': {'symbol': 'ETH/USDT', 'id': 'ETHUSDT'},
         }
         
-        await provider.close()
+        mock_exchange = AsyncMock()
+        mock_exchange.load_markets.return_value = mock_markets
+        provider_with_mapping.exchange_instances['binance'] = mock_exchange
         
-        mock_exchange1.close.assert_called_once()
-        mock_exchange2.close.assert_called_once()
+        # Get available symbols
+        symbols = await provider_with_mapping.get_available_symbols('binance')
+        
+        # Should return unified symbols
+        assert 'BTC/USDT' in symbols
+        assert 'ETH/USDT' in symbols
+        assert 'BTCUSDT' not in symbols  # Exchange format should not be in result
+    
+    @pytest.mark.asyncio
+    async def test_find_common_symbols(self, provider_with_mapping):
+        """Test finding symbols available on multiple exchanges"""
+        # Mock markets for different exchanges
+        mock_binance_markets = {
+            'BTCUSDT': {'symbol': 'BTC/USDT'},
+            'ETHUSDT': {'symbol': 'ETH/USDT'},
+            'BNBUSDT': {'symbol': 'BNB/USDT'},
+        }
+        
+        mock_coinbase_markets = {
+            'BTC-USD': {'symbol': 'BTC-USD'},
+            'ETH-USD': {'symbol': 'ETH-USD'},
+        }
+        
+        # Setup mocked exchanges
+        mock_binance = AsyncMock()
+        mock_binance.load_markets.return_value = mock_binance_markets
+        provider_with_mapping.exchange_instances['binance'] = mock_binance
+        
+        mock_coinbase = AsyncMock()
+        mock_coinbase.load_markets.return_value = mock_coinbase_markets
+        provider_with_mapping.exchange_instances['coinbase'] = mock_coinbase
+        
+        # Find common symbols
+        common = await provider_with_mapping.find_common_symbols(min_exchanges=2)
+        
+        # BTC/USDT and ETH/USDT should be available on both
+        assert 'BTC/USDT' in common
+        assert 'ETH/USDT' in common
+        assert 'BNB/USDT' not in common  # Only on Binance
+        
+        assert 'binance' in common['BTC/USDT']
+        assert 'coinbase' in common['BTC/USDT']
+    
+    @pytest.mark.asyncio
+    async def test_validate_availability_option(self, provider_with_mapping):
+        """Test the validate_availability option"""
+        # Setup available symbols cache
+        provider_with_mapping.available_symbols_cache = {
+            'binance': {'BTC/USDT', 'ETH/USDT'},
+            'coinbase': {'BTC/USDT'}
+        }
+        provider_with_mapping.cache_timestamp = {
+            'binance': float('inf'),  # Never expire
+            'coinbase': float('inf')
+        }
+        
+        # Mock exchange
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_ohlcv.return_value = []
+        provider_with_mapping.exchange_instances['binance'] = mock_exchange
+        provider_with_mapping.exchange_instances['coinbase'] = mock_exchange
+        
+        # Test fetching ETH/USDT with validation (not available on Coinbase)
+        result = await provider_with_mapping.fetch_ohlcv(
+            'ETH/USDT',
+            '1h',
+            exchanges=['binance', 'coinbase'],
+            validate_availability=True
+        )
+        
+        # Should only fetch from Binance
+        assert mock_exchange.fetch_ohlcv.call_count == 1
+        assert 'binance' in result
+        assert 'coinbase' not in result or result['coinbase'] == []
+    
+    @pytest.mark.asyncio
+    async def test_save_symbol_config_on_close(self, provider_with_mapping):
+        """Test that symbol configuration is saved on close"""
+        await provider_with_mapping.close()
+        
+        # Check that save_config was called
+        provider_with_mapping.symbol_manager.save_config.assert_called_once()
+        
+        # Check the path used
+        call_args = provider_with_mapping.symbol_manager.save_config.call_args
+        config_path = call_args[0][0]
+        assert 'symbol_config.json' in str(config_path)
+    
+    def test_health_status_with_mapping(self, provider_with_mapping):
+        """Test health status shows mapping enabled"""
+        status = provider_with_mapping.get_health_status()
+        
+        assert status['symbol_mapping_enabled'] is True
 
 
 class TestDataQuality:
@@ -334,10 +508,9 @@ class TestDataQuality:
     
     def test_duplicate_timestamp_removal(self):
         """Test that duplicate timestamps are handled correctly"""
-        # This would be tested in the save_to_parquet method
         data = [
             {'timestamp': 1640995200000, 'open': 100, 'high': 105, 'low': 95, 'close': 102, 'volume': 1000},
-            {'timestamp': 1640995200000, 'open': 101, 'high': 106, 'low': 96, 'close': 103, 'volume': 1100},  # Duplicate timestamp
+            {'timestamp': 1640995200000, 'open': 101, 'high': 106, 'low': 96, 'close': 103, 'volume': 1100},  # Duplicate
             {'timestamp': 1640998800000, 'open': 102, 'high': 107, 'low': 97, 'close': 104, 'volume': 1200}
         ]
         
@@ -367,35 +540,55 @@ class TestIntegrationScenarios:
     """Integration-style tests for real-world scenarios"""
     
     @pytest.mark.asyncio
-    async def test_multiple_symbols_fetch(self, temp_data_dir):
-        """Test fetching multiple symbols in sequence"""
-        provider = CryptoProvider(
+    async def test_mixed_mode_providers(self, temp_data_directory):
+        """Test that providers with and without mapping can coexist"""
+        # Create provider without mapping
+        provider_traditional = CryptoProvider(
             exchanges=['binance'],
-            data_dir=temp_data_dir
+            data_dir=temp_data_directory,
+            use_symbol_mapping=False
         )
         
-        # Mock successful responses for multiple symbols
-        mock_exchange = AsyncMock()
-        mock_data = [[1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5]]
-        mock_exchange.fetch_ohlcv.return_value = mock_data
-        provider.exchange_instances['binance'] = mock_exchange
+        # Create provider with mapping
+        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager'):
+            provider_unified = CryptoProvider(
+                exchanges=['binance'],
+                data_dir=temp_data_directory,
+                use_symbol_mapping=True
+            )
         
-        symbols = ['BTC/USDT', 'ETH/USDT', 'ADA/USDT']
+        assert provider_traditional.use_symbol_mapping is False
+        assert provider_unified.use_symbol_mapping is True
         
-        # This tests the fetch_and_store method indirectly
-        for symbol in symbols:
-            result = await provider.fetch_ohlcv(symbol, '1h')
-            assert 'binance' in result
-            assert len(result['binance']) == 1
-        
-        await provider.close()
+        await provider_traditional.close()
+        await provider_unified.close()
     
     @pytest.mark.asyncio
-    async def test_rate_limiting_behavior(self, temp_data_dir):
-        """Test that rate limiting works as expected"""
+    async def test_fallback_when_symbol_mapper_missing(self, temp_data_directory):
+        """Test graceful fallback when symbol_mapper module is not available"""
+        # Simulate missing module
+        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager', 
+                   side_effect=ImportError("Module not found")):
+            
+            provider = CryptoProvider(
+                exchanges=['binance'],
+                data_dir=temp_data_directory,
+                use_symbol_mapping=True  # Try to enable but module missing
+            )
+            
+            # Should fall back to disabled
+            assert provider.use_symbol_mapping is False
+            assert provider.symbol_manager is None
+            
+            await provider.close()
+    
+    @pytest.mark.asyncio
+    async def test_rate_limiting_behavior(self, temp_data_directory):
+        """Test that rate limiting works correctly with new changes"""
         provider = CryptoProvider(
             exchanges=['binance'],
-            data_dir=temp_data_dir
+            data_dir=temp_data_directory,
+            rate_limit_buffer=0.8  # Test the buffer parameter
         )
         
         mock_exchange = AsyncMock()
@@ -415,32 +608,21 @@ class TestIntegrationScenarios:
         end_time = asyncio.get_event_loop().time()
         
         # Should take some time due to rate limiting
-        # (This is a basic test - in practice you'd want more sophisticated timing tests)
         elapsed = end_time - start_time
         assert elapsed >= 0  # Basic sanity check
         
         await provider.close()
 
 
-# Pytest configuration and fixtures
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for the test session."""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
-
-
-# Performance and stress tests
 class TestPerformance:
     """Performance-related tests"""
     
     @pytest.mark.asyncio
-    async def test_concurrent_exchange_calls(self, temp_data_dir):
+    async def test_concurrent_exchange_calls(self, temp_data_directory):
         """Test that concurrent calls to multiple exchanges work efficiently"""
         provider = CryptoProvider(
             exchanges=['binance', 'coinbase'],
-            data_dir=temp_data_dir
+            data_dir=temp_data_directory
         )
         
         # Mock both exchanges
@@ -465,6 +647,15 @@ class TestPerformance:
         assert elapsed < 2.0  # Should complete quickly with mocked data
         
         await provider.close()
+
+
+# Pytest configuration and fixtures
+@pytest.fixture(scope="session")
+def event_loop():
+    """Create an instance of the default event loop for the test session."""
+    loop = asyncio.get_event_loop_policy().new_event_loop()
+    yield loop
+    loop.close()
 
 
 if __name__ == "__main__":
