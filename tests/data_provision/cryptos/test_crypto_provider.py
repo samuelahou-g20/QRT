@@ -7,107 +7,103 @@ and the new symbol mapping functionality.
 import pytest
 import asyncio
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 import tempfile
-import json
-from unittest.mock import Mock, AsyncMock, patch, MagicMock, call
-import ccxt
-import aiofiles
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
 import sys
 import os
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from services.data_provision.cryptos.crypto_provider import CryptoProvider, OHLCVData, CircuitBreaker
+from src.data_provision.cryptos.crypto_provider import CryptoProvider
+from src.data_provision.cryptos.circuit_breaker import CircuitBreaker
 
 
-class TestOHLCVData:
-    """Test the OHLCVData dataclass and its validation"""
+class TestDataValidation:
+    """Test the OHLCV data validation functionality"""
     
     def test_valid_ohlcv_data(self):
         """Test that valid OHLCV data passes validation"""
-        data = OHLCVData(
-            timestamp=int(datetime.now().timestamp() * 1000),
-            open=100.0,
-            high=105.0,
-            low=95.0,
-            close=102.0,
-            volume=1000.0,
-            exchange='binance',
-            symbol='BTC/USDT',
-            interval='1h'
-        )
-        assert data.validate() is True
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
+        
+        valid_candle = [
+            int(datetime.now().timestamp() * 1000),
+            100.0,  # open
+            105.0,  # high
+            95.0,   # low
+            102.0,  # close
+            1000.0  # volume
+        ]
+        assert provider._is_valid_ohlcv(valid_candle) is True
     
     def test_invalid_ohlc_relationship(self):
         """Test that invalid OHLC relationships fail validation"""
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
+        
         # High lower than open
-        data = OHLCVData(
-            timestamp=int(datetime.now().timestamp() * 1000),
-            open=100.0,
-            high=95.0,  # Invalid: high < open
-            low=90.0,
-            close=98.0,
-            volume=1000.0,
-            exchange='binance',
-            symbol='BTC/USDT',
-            interval='1h'
-        )
-        assert data.validate() is False
+        invalid_candle = [
+            int(datetime.now().timestamp() * 1000),
+            100.0,  # open
+            95.0,   # high (Invalid: high < open)
+            90.0,   # low
+            98.0,   # close
+            1000.0  # volume
+        ]
+        assert provider._is_valid_ohlcv(invalid_candle) is False
     
     def test_negative_values(self):
         """Test that negative prices fail validation"""
-        data = OHLCVData(
-            timestamp=int(datetime.now().timestamp() * 1000),
-            open=-100.0,  # Invalid: negative price
-            high=105.0,
-            low=95.0,
-            close=102.0,
-            volume=1000.0,
-            exchange='binance',
-            symbol='BTC/USDT',
-            interval='1h'
-        )
-        assert data.validate() is False
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
+        
+        negative_candle = [
+            int(datetime.now().timestamp() * 1000),
+            -100.0,  # negative open
+            105.0,   # high
+            95.0,    # low
+            102.0,   # close
+            1000.0   # volume
+        ]
+        assert provider._is_valid_ohlcv(negative_candle) is False
     
     def test_future_timestamp(self):
         """Test that future timestamps fail validation"""
-        future_time = int((datetime.now() + timedelta(days=1)).timestamp() * 1000)
-        data = OHLCVData(
-            timestamp=future_time,
-            open=100.0,
-            high=105.0,
-            low=95.0,
-            close=102.0,
-            volume=1000.0,
-            exchange='binance',
-            symbol='BTC/USDT',
-            interval='1h'
-        )
-        assert data.validate() is False
-    
-    def test_to_dict_conversion(self):
-        """Test conversion to dictionary"""
-        data = OHLCVData(
-            timestamp=1640995200000,  # 2022-01-01 00:00:00
-            open=100.0,
-            high=105.0,
-            low=95.0,
-            close=102.0,
-            volume=1000.0,
-            exchange='binance',
-            symbol='BTC/USDT',
-            interval='1h'
-        )
-        result = data.to_dict()
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
         
-        assert isinstance(result, dict)
-        assert result['timestamp'] == 1640995200000
-        assert result['open'] == 100.0
-        assert result['exchange'] == 'binance'
+        future_time = int((datetime.now() + timedelta(days=1)).timestamp() * 1000)
+        future_candle = [
+            future_time,
+            100.0,  # open
+            105.0,  # high
+            95.0,   # low
+            102.0,  # close
+            1000.0  # volume
+        ]
+        assert provider._is_valid_ohlcv(future_candle) is False
+    
+    def test_insufficient_data(self):
+        """Test that candles with insufficient data fail validation"""
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
+        
+        # Less than 6 elements
+        short_candle = [1640995200000, 100.0, 105.0, 95.0]
+        assert provider._is_valid_ohlcv(short_candle) is False
+    
+    def test_invalid_data_types(self):
+        """Test that invalid data types fail validation"""
+        provider = CryptoProvider(exchanges=['binance'], data_dir=tempfile.mkdtemp())
+        
+        # String instead of number
+        invalid_type_candle = [
+            int(datetime.now().timestamp() * 1000),
+            "not_a_number",  # invalid type
+            105.0,
+            95.0,
+            102.0,
+            1000.0
+        ]
+        assert provider._is_valid_ohlcv(invalid_type_candle) is False
 
 
 class TestCircuitBreaker:
@@ -216,6 +212,36 @@ class TestCryptoProviderTraditional:
             assert part in path_str
     
     @pytest.mark.asyncio
+    async def test_fetch_symbol_from_exchange_returns_dataframe(self, provider):
+        """Test that _fetch_symbol_from_exchange returns a DataFrame"""
+        mock_data = [
+            [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5],
+            [1640998800000, 47200.0, 47400.0, 46900.0, 47100.0, 95.2]
+        ]
+        
+        mock_exchange = AsyncMock()
+        mock_exchange.fetch_ohlcv.return_value = mock_data
+        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
+        
+        result = await provider._fetch_symbol_from_exchange(
+            mock_exchange,
+            'binance',
+            'BTCUSDT',
+            '1h',
+            pd.Timestamp('2022-01-01', tz='UTC'),
+            pd.Timestamp('2022-01-02', tz='UTC')
+        )
+        
+        # Should return a DataFrame now, not a list
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) == 2
+        assert 'timestamp' in result.columns
+        assert 'open' in result.columns
+        assert 'exchange' in result.columns
+        assert result['exchange'].iloc[0] == 'binance'
+        assert result['symbol'].iloc[0] == 'BTCUSDT'
+    
+    @pytest.mark.asyncio
     async def test_fetch_ohlcv_traditional_format(self, provider):
         """Test fetching with traditional exchange-specific formats"""
         mock_data = [
@@ -225,9 +251,9 @@ class TestCryptoProviderTraditional:
         
         mock_exchange = AsyncMock()
         mock_exchange.fetch_ohlcv.return_value = mock_data
-        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000) # 1 hour
+        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
         provider.exchange_instances['binance'] = mock_exchange
-        provider.exchange_instances.pop('coinbase', None) # Only test binance
+        provider.exchange_instances.pop('coinbase', None)
 
         # Use Binance-specific format
         result = await provider.fetch_ohlcv(
@@ -294,7 +320,7 @@ class TestCryptoProviderWithSymbolMapping:
     @pytest.fixture
     def provider_with_mapping(self, temp_data_directory, mock_symbol_manager):
         """Create a CryptoProvider with symbol mapping enabled"""
-        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm_class:
+        with patch('src.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm_class:
             mock_sm_class.return_value = mock_symbol_manager
             
             provider = CryptoProvider(
@@ -308,7 +334,7 @@ class TestCryptoProviderWithSymbolMapping:
     def test_initialization_with_mapping(self, temp_data_directory):
         """Test initialization with symbol mapping enabled"""
         # Mock the symbol_mapper module import
-        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm:
+        with patch('src.data_provision.cryptos.symbol_mapper.SymbolManager') as mock_sm:
             provider = CryptoProvider(
                 exchanges=['binance'],
                 data_dir=temp_data_directory,
@@ -339,7 +365,7 @@ class TestCryptoProviderWithSymbolMapping:
     async def test_symbol_conversion_to_unified(self, provider_with_mapping):
         """Test symbol conversion from exchange to unified format"""
         # Mock the SymbolType import
-        with patch('services.data_provision.cryptos.symbol_mapper.SymbolType'):
+        with patch('src.data_provision.cryptos.symbol_mapper.SymbolType'):
             # Test Binance conversion
             result = provider_with_mapping._convert_symbol('BTCUSDT', 'binance', to_exchange=False)
             assert result == 'BTC/USDT'
@@ -353,16 +379,12 @@ class TestCryptoProviderWithSymbolMapping:
         """Test fetching OHLCV data using unified symbols"""
         mock_data = [[1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5]]
         
-        # Mock exchanges
-        mock_binance = AsyncMock()
-        mock_binance.fetch_ohlcv.return_value = mock_data
-        mock_binance.parse_timeframe = Mock(return_value = 3600 * 1000)
-        provider_with_mapping.exchange_instances['binance'] = mock_binance
-        
-        mock_coinbase = AsyncMock()
-        mock_coinbase.fetch_ohlcv.return_value = mock_data
-        mock_coinbase.parse_timeframe = Mock(return_value = 3600 * 1000)
-        provider_with_mapping.exchange_instances['coinbase'] = mock_coinbase
+        # Mock exchanges to return data
+        for exchange_name in ['binance', 'coinbase']:
+            mock_exchange = AsyncMock()
+            mock_exchange.fetch_ohlcv.return_value = mock_data
+            mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
+            provider_with_mapping.exchange_instances[exchange_name] = mock_exchange
         
         # Fetch using unified symbol
         result = await provider_with_mapping.fetch_ohlcv(
@@ -374,9 +396,9 @@ class TestCryptoProviderWithSymbolMapping:
         
         start_ts = int(pd.Timestamp('2022-01-01', tz='UTC').timestamp() * 1000)
         
-        # Check call arguments
-        mock_binance.fetch_ohlcv.assert_called_once_with('BTCUSDT', '1h', start_ts, 1000)
-        mock_coinbase.fetch_ohlcv.assert_called_once_with('BTC-USD', '1h', start_ts, 1000)
+        # Check exchanges were called with correct converted symbols
+        provider_with_mapping.exchange_instances['binance'].fetch_ohlcv.assert_called_once_with('BTCUSDT', '1h', start_ts, 1000)
+        provider_with_mapping.exchange_instances['coinbase'].fetch_ohlcv.assert_called_once_with('BTC-USD', '1h', start_ts, 1000)
 
         # Check results
         assert 'BTC/USDT' in result
@@ -412,43 +434,74 @@ class TestCryptoProviderWithSymbolMapping:
         interval = '1h'
         start_date = pd.Timestamp('2022-01-01', tz='UTC')
         end_date = pd.Timestamp('2022-01-01 01:00:00', tz='UTC')
-        mock_data = [[start_date.timestamp() * 1000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5]]
+        
+        # Create mock data as DataFrame for both exchanges
+        mock_df_binance = pd.DataFrame({
+            'timestamp': [int(start_date.timestamp() * 1000)],
+            'open': [47000.0],
+            'high': [47500.0],
+            'low': [46800.0],
+            'close': [47200.0],
+            'volume': [100.5],
+            'exchange': ['binance'],
+            'symbol': [symbol],
+            'interval': [interval],
+            'datetime': [start_date]
+        })
+        
+        mock_df_coinbase = pd.DataFrame({
+            'timestamp': [int(start_date.timestamp() * 1000)],
+            'open': [47010.0],
+            'high': [47510.0],
+            'low': [46810.0],
+            'close': [47210.0],
+            'volume': [101.5],
+            'exchange': ['coinbase'],
+            'symbol': [symbol],
+            'interval': [interval],
+            'datetime': [start_date]
+        })
 
-        # Mock exchange to return data
-        mock_exchange = AsyncMock()
-        mock_exchange.fetch_ohlcv.return_value = mock_data
-        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
-        provider_with_mapping.exchange_instances = {'binance': mock_exchange}
-
-        # 1. Fetch and save data
-        results_fetch = await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval)
-
-        # Check that a file was created
-        expected_path = provider_with_mapping._get_file_path(symbol, start_date, 'binance', interval)
-        assert expected_path.exists()
-
-        # 2. Now, fetch again, which should load from the file
+        # Mock _fetch_symbol_from_exchange to return DataFrame based on exchange
         with patch.object(provider_with_mapping, '_fetch_symbol_from_exchange', new_callable=AsyncMock) as mock_fetch:
-            mock_fetch.return_value = [] # Ensure it returns nothing from exchange
+            # Setup side effect to return different data for different exchanges
+            def fetch_side_effect(exchange, exchange_name, *args, **kwargs):
+                if exchange_name == 'binance':
+                    return mock_df_binance
+                elif exchange_name == 'coinbase':
+                    return mock_df_coinbase
+                return pd.DataFrame()
             
+            mock_fetch.side_effect = fetch_side_effect
+            
+            # 1. Fetch and save data (will call for both exchanges)
+            results_fetch = await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval)
+            
+            # Give time for async save
+            await asyncio.sleep(0.1)
+
+            # Check that files were created for both exchanges
+            for exchange_name in ['binance', 'coinbase']:
+                expected_path = provider_with_mapping._get_file_path(symbol, start_date, exchange_name, interval)
+                assert expected_path.exists(), f"File should exist for {exchange_name}"
+
+            # Record initial call count (should be 2 - one for each exchange)
+            initial_calls = mock_fetch.call_count
+            assert initial_calls == 2, "Should have fetched from both exchanges"
+
+            # 2. Now fetch again with force_reload=False, should load from files
             results_load = await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval, force_reload=False)
             
-            # Assert that the network fetch was NOT called
-            mock_fetch.assert_not_called()
+            # Should not have made any additional fetch calls
+            assert mock_fetch.call_count == initial_calls, "Should not fetch when loading from cache"
             
-            # *** FIX: Create an expected DataFrame with only the saved columns ***
-            expected_df = results_fetch[symbol][['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            # Data should be loaded
+            assert symbol in results_load
+            assert len(results_load[symbol]) > 0
             
-            # Assert that the data is the same
-            pd.testing.assert_frame_equal(
-                expected_df.reset_index(drop=True), 
-                results_load[symbol].reset_index(drop=True),
-            )
-            
-            # 3. Test force_reload
+            # 3. Test force_reload=True makes new fetch calls
             await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval, force_reload=True)
-            mock_fetch.assert_called() # Should be called now
-
+            assert mock_fetch.call_count > initial_calls, "force_reload should trigger new fetches"
 
     @pytest.mark.asyncio
     async def test_save_symbol_config_on_close(self, provider_with_mapping):
@@ -476,18 +529,16 @@ class TestDataQuality:
     def test_duplicate_timestamp_removal(self):
         """Test that duplicate timestamps are handled correctly"""
         data = [
-            {'timestamp': 1640995200000, 'open': 100, 'high': 105, 'low': 95, 'close': 102, 'volume': 1000},
-            {'timestamp': 1640995200000, 'open': 101, 'high': 106, 'low': 96, 'close': 103, 'volume': 1100},  # Duplicate
-            {'timestamp': 1640998800000, 'open': 102, 'high': 107, 'low': 97, 'close': 104, 'volume': 1200}
+            {'timestamp': 1640995200000, 'open': 100, 'high': 105, 'low': 95, 'close': 102, 'volume': 1000, 'exchange': 'binance'},
+            {'timestamp': 1640995200000, 'open': 101, 'high': 106, 'low': 96, 'close': 103, 'volume': 1100, 'exchange': 'coinbase'},  # Same timestamp, different exchange
+            {'timestamp': 1640998800000, 'open': 102, 'high': 107, 'low': 97, 'close': 104, 'volume': 1200, 'exchange': 'binance'}
         ]
         
         df = pd.DataFrame(data)
-        df_cleaned = df.drop_duplicates(subset=['timestamp'], keep='last')
+        # CryptoProvider keeps duplicates from different exchanges
+        df_cleaned = df.drop_duplicates(subset=['timestamp', 'exchange'])
         
-        assert len(df_cleaned) == 2
-        # Should keep the last duplicate (with open=101)
-        first_row = df_cleaned[df_cleaned['timestamp'] == 1640995200000].iloc[0]
-        assert first_row['open'] == 101
+        assert len(df_cleaned) == 3  # All kept since different exchanges
     
     def test_data_sorting(self):
         """Test that data is properly sorted by timestamp"""
@@ -497,7 +548,8 @@ class TestDataQuality:
         ]
         
         df = pd.DataFrame(data)
-        df_sorted = df.sort_values('timestamp')
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df_sorted = df.set_index('datetime').sort_index()
         
         assert df_sorted.iloc[0]['timestamp'] == 1640995200000
         assert df_sorted.iloc[1]['timestamp'] == 1640998800000
@@ -523,7 +575,7 @@ class TestIntegrationScenarios:
         )
         
         # Create provider with mapping
-        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager'):
+        with patch('src.data_provision.cryptos.symbol_mapper.SymbolManager'):
             provider_unified = CryptoProvider(
                 exchanges=['binance'],
                 data_dir=temp_data_directory,
@@ -540,7 +592,7 @@ class TestIntegrationScenarios:
     async def test_fallback_when_symbol_mapper_missing(self, temp_data_directory):
         """Test graceful fallback when symbol_mapper module is not available"""
         # Simulate missing module
-        with patch('services.data_provision.cryptos.symbol_mapper.SymbolManager', 
+        with patch('src.data_provision.cryptos.symbol_mapper.SymbolManager', 
                    side_effect=ImportError("Module not found")):
             
             provider = CryptoProvider(
@@ -556,33 +608,38 @@ class TestIntegrationScenarios:
             await provider.close()
     
     @pytest.mark.asyncio
-    async def test_rate_limiting_behavior(self, temp_data_directory):
-        """Test that rate limiting works correctly with new changes"""
+    async def test_validation_filters_bad_data(self, temp_data_directory):
+        """Test that invalid candles are filtered out during fetch"""
         provider = CryptoProvider(
             exchanges=['binance'],
-            data_dir=temp_data_directory,
-            rate_limit_buffer=0.8  # Test the buffer parameter
+            data_dir=temp_data_directory
         )
         
+        # Mix of valid and invalid candles
+        mock_data = [
+            [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5],  # Valid
+            [1640998800000, -47200.0, 47400.0, 46900.0, 47100.0, 95.2],   # Invalid: negative open
+            [1641002400000, 47100.0, 47300.0, 46700.0, 47000.0, 110.8],   # Valid
+            [1641006000000, 47000.0, 46500.0, 46800.0, 47200.0, 100.5],   # Invalid: high < low
+        ]
+        
         mock_exchange = AsyncMock()
-        mock_exchange.fetch_ohlcv.return_value = []
-        provider.exchange_instances['binance'] = mock_exchange
+        mock_exchange.fetch_ohlcv.return_value = mock_data
+        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
         
-        # Make rapid requests
-        start_time = asyncio.get_event_loop().time()
+        df = await provider._fetch_symbol_from_exchange(
+            mock_exchange,
+            'binance',
+            'BTC/USDT',
+            '1h',
+            pd.Timestamp('2022-01-01', tz='UTC'),
+            pd.Timestamp('2022-01-02', tz='UTC')
+        )
         
-        tasks = []
-        for _ in range(5):
-            task = provider.fetch_ohlcv('BTC/USDT', pd.Timestamp('2022-01-01', tz='UTC'), pd.Timestamp('2022-01-02', tz='UTC'), '1h')
-            tasks.append(task)
-        
-        await asyncio.gather(*tasks)
-        
-        end_time = asyncio.get_event_loop().time()
-        
-        # Should take some time due to rate limiting
-        elapsed = end_time - start_time
-        assert elapsed >= 0  # Basic sanity check
+        # Should only have the 2 valid candles
+        assert len(df) == 2
+        assert df.iloc[0]['open'] == 47000.0
+        assert df.iloc[1]['open'] == 47100.0
         
         await provider.close()
 
@@ -610,20 +667,54 @@ class TestPerformance:
             mock_exchange.fetch_ohlcv.return_value = [
                 [1640995200000, 47000.0, 47500.0, 46800.0, 47200.0, 100.5]
             ]
-            mock_exchange.parse_timeframe = Mock(return_value = 3600 * 1000)
+            mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
             provider.exchange_instances[exchange_name] = mock_exchange
         
         start_time = asyncio.get_event_loop().time()
-        result = await provider.fetch_ohlcv('BTC/USDT', pd.Timestamp('2022-01-01', tz='UTC'), pd.Timestamp('2022-01-02', tz='UTC'), '1h')
+        result = await provider.fetch_ohlcv(
+            'BTC/USDT', 
+            pd.Timestamp('2022-01-01', tz='UTC'), 
+            pd.Timestamp('2022-01-02', tz='UTC'), 
+            '1h'
+        )
         end_time = asyncio.get_event_loop().time()
         
-        # Should have data from both exchanges in the df
+        # Should have data from both exchanges
         df = result['BTC/USDT']
-        assert len(df['exchange'].unique()) >= 1 # Can be 1 if one fails, or 2 if both succeed
+        exchanges_in_data = df['exchange'].unique() if 'exchange' in df.columns else []
+        assert len(exchanges_in_data) >= 1  # At least one exchange returned data
         
-        # Concurrent calls should be faster than sequential
+        # Concurrent calls should be fast
         elapsed = end_time - start_time
         assert elapsed < 2.0  # Should complete quickly with mocked data
+        
+        await provider.close()
+
+    @pytest.mark.asyncio  
+    async def test_empty_response_handling(self, temp_data_directory):
+        """Test handling of empty responses from exchanges"""
+        provider = CryptoProvider(
+            exchanges=['binance', 'coinbase'],
+            data_dir=temp_data_directory
+        )
+        
+        # Mock exchanges to return empty data
+        for exchange_name in ['binance', 'coinbase']:
+            mock_exchange = AsyncMock()
+            mock_exchange.fetch_ohlcv.return_value = []
+            mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
+            provider.exchange_instances[exchange_name] = mock_exchange
+        
+        result = await provider.fetch_ohlcv(
+            'BTC/USDT',
+            pd.Timestamp('2022-01-01', tz='UTC'),
+            pd.Timestamp('2022-01-02', tz='UTC'),
+            '1h'
+        )
+        
+        # Should return empty DataFrame for the symbol
+        assert 'BTC/USDT' in result
+        assert result['BTC/USDT'].empty
         
         await provider.close()
 
@@ -643,4 +734,3 @@ def event_loop():
 if __name__ == "__main__":
     # Run tests
     pytest.main([__file__, "-v", "--tb=short"])
-

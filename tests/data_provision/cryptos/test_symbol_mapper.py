@@ -4,17 +4,16 @@ Tests symbol conversions, mappers for different exchanges, and the symbol manage
 """
 
 import pytest
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 import sys
 import os
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from services.data_provision.cryptos.symbol_mapper import (
+from src.data_provision.cryptos.symbol_mapper import (
     UnifiedSymbol, SymbolType, SymbolManager,
     BinanceSymbolMapper, CoinbaseSymbolMapper, KrakenSymbolMapper,
     OKXSymbolMapper, BybitSymbolMapper, ExchangeSymbolMapper

@@ -7,27 +7,16 @@ import asyncio
 import ccxt
 import ccxt.async_support as ccxt_async
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Union, Set
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Any, Union, Set
 import logging
 import time
-import json
-from abc import ABC, abstractmethod
-import aiofiles
 import aiolimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import hashlib
-import dotenv
 
 from src.data_provision.base_provider import BaseDataProvider
-from src.data_provision.circuit_breaker import CircuitBreaker
-from src.data_provision.ohlcv_data import OHLCVData
-
-# Load environment variables
-dotenv.load_dotenv()
+from src.data_provision.cryptos.circuit_breaker import CircuitBreaker
 
 
 class CryptoProvider(BaseDataProvider):
@@ -172,15 +161,33 @@ class CryptoProvider(BaseDataProvider):
 
 
     def _is_valid_ohlcv(self, candle: List) -> bool:
-        """Helper to validate a single candle."""
+        """Validate a single candle."""
         try:
-            data = OHLCVData(
-                timestamp=int(candle[0]), open=float(candle[1]), high=float(candle[2]),
-                low=float(candle[3]), close=float(candle[4]), volume=float(candle[5]),
-                exchange='', symbol='', interval=''
-            )
-            return data.validate()
-        except (ValueError, IndexError):
+            if len(candle) < 6:
+                return False
+            
+            timestamp, open_p, high, low, close, volume = candle[:6]
+            
+            # Convert to float for validation
+            open_p, high, low, close, volume = map(float, [open_p, high, low, close, volume])
+            
+            # Check OHLC relationships
+            if not (low <= open_p <= high and low <= close <= high and low <= high):
+                return False
+            
+            # Check for negative values
+            if any(v < 0 for v in [open_p, high, low, close, volume]):
+                return False
+            
+            # Optional: Check timestamp is reasonable (not in future, not too old)
+            now = int(datetime.now(timezone.utc).timestamp() * 1000)
+            timestamp = int(timestamp)
+            # Allow data up to 10 years old
+            if timestamp > now or timestamp < (now - 10 * 365 * 24 * 60 * 60 * 1000):
+                return False
+                
+            return True
+        except (ValueError, TypeError, IndexError):
             return False
 
 
@@ -196,13 +203,14 @@ class CryptoProvider(BaseDataProvider):
         interval: str, 
         start_date: Union[pd.Timestamp, datetime], 
         end_date: Union[pd.Timestamp, datetime]
-    ) -> List[OHLCVData]:
+    ) -> pd.DataFrame:
         """
         Fetch OHLCV data for a single symbol from a specific exchange.
+        Returns a DataFrame directly instead of OHLCVData objects.
         """
         since = int(start_date.timestamp() * 1000)
         limit = 1000  # Default limit per request
-        all_ohlcv = []
+        all_candles = []
 
         while since < end_date.timestamp() * 1000:
             circuit_breaker = self.circuit_breakers[exchange_name]
@@ -219,15 +227,10 @@ class CryptoProvider(BaseDataProvider):
                 if not raw_data:
                     break
 
-                ohlcv_data = [
-                    OHLCVData(
-                        timestamp=int(c[0]), open=float(c[1]), high=float(c[2]),
-                        low=float(c[3]), close=float(c[4]), volume=float(c[5]),
-                        exchange=exchange_name, symbol=symbol, interval=interval
-                    ) for c in raw_data if self._is_valid_ohlcv(c)
-                ]
+                # Filter valid candles and collect them
+                valid_candles = [c for c in raw_data if self._is_valid_ohlcv(c)]
+                all_candles.extend(valid_candles)
                 
-                all_ohlcv.extend(ohlcv_data)
                 since = raw_data[-1][0] + exchange.parse_timeframe(interval) * 1000
                 circuit_breaker.record_success()
 
@@ -236,7 +239,18 @@ class CryptoProvider(BaseDataProvider):
                 self.logger.error(f"Error fetching from {exchange_name} for {symbol}: {e}")
                 break
         
-        return all_ohlcv
+        # Convert to DataFrame if we have data
+        if not all_candles:
+            return pd.DataFrame()
+        
+        # Create DataFrame directly from candles
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['exchange'] = exchange_name
+        df['symbol'] = symbol
+        df['interval'] = interval
+        df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        
+        return df
 
 
     def _get_file_path(self, symbol: str, date: datetime, exchange: str, 
@@ -262,8 +276,7 @@ class CryptoProvider(BaseDataProvider):
     async def _load_symbol_from_parquet(self, symbol: str, start_date: datetime, end_date: datetime, interval: str) -> pd.DataFrame:
         """Loads data for a single symbol from local Parquet files within a date range."""
         all_dfs = []
-        clean_symbol = symbol.replace('/', '_').replace('-', '_')
-
+        
         date_range = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
 
         for exchange_name in self.exchanges:
@@ -272,6 +285,13 @@ class CryptoProvider(BaseDataProvider):
                 if file_path.exists():
                     try:
                         df = pd.read_parquet(file_path)
+                        # Add exchange, symbol, interval columns if missing (for backward compatibility)
+                        if 'exchange' not in df.columns:
+                            df['exchange'] = exchange_name
+                        if 'symbol' not in df.columns:
+                            df['symbol'] = symbol
+                        if 'interval' not in df.columns:
+                            df['interval'] = interval
                         all_dfs.append(df)
                     except Exception as e:
                         self.logger.error(f"Error loading Parquet file {file_path}: {e}")
@@ -280,7 +300,10 @@ class CryptoProvider(BaseDataProvider):
             return pd.DataFrame()
 
         combined_df = pd.concat(all_dfs, ignore_index=True)
-        combined_df['datetime'] = pd.to_datetime(combined_df['timestamp'], unit='ms', utc=True)
+        
+        # Ensure datetime column exists
+        if 'datetime' not in combined_df.columns:
+            combined_df['datetime'] = pd.to_datetime(combined_df['timestamp'], unit='ms', utc=True)
         
         combined_df = combined_df.set_index('datetime')
         mask = (combined_df.index >= start_date) & (combined_df.index <= end_date)
@@ -297,15 +320,15 @@ class CryptoProvider(BaseDataProvider):
             return
 
         df_to_save = data.copy()
+        
         # Ensure 'datetime' is the index for Grouper
-        if 'datetime' in df_to_save.columns:
+        if 'datetime' in df_to_save.columns and df_to_save.index.name != 'datetime':
             df_to_save = df_to_save.set_index('datetime')
-        elif df_to_save.index.name != 'datetime':
-            self.logger.error("DataFrame for saving must have a 'datetime' index or column.")
-            return
-
-        # The DataFrame might contain data for multiple symbols if called directly,
-        # but from fetch_ohlcv it will only contain one.
+        elif df_to_save.index.name != 'datetime' and 'timestamp' in df_to_save.columns:
+            df_to_save['datetime'] = pd.to_datetime(df_to_save['timestamp'], unit='ms', utc=True)
+            df_to_save = df_to_save.set_index('datetime')
+        
+        # Group by exchange, symbol, interval
         for (exchange_name, symbol, interval), group in df_to_save.groupby(['exchange', 'symbol', 'interval']):
             if group.empty:
                 continue
@@ -318,8 +341,10 @@ class CryptoProvider(BaseDataProvider):
                 file_path = self._get_file_path(symbol, date, exchange_name, interval)
                 
                 try:
-                    # Drop redundant columns before saving
-                    daily_group_to_save = daily_group.drop(columns=['exchange', 'symbol', 'interval'])
+                    # Keep essential columns, drop redundant ones
+                    columns_to_save = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                    daily_group_to_save = daily_group[columns_to_save] if all(c in daily_group.columns for c in columns_to_save) else daily_group
+                    
                     # Reset index to save datetime as a column
                     daily_group_to_save.reset_index().to_parquet(file_path, compression='snappy', index=False)
                     self.logger.info(f"Saved {len(daily_group)} records for {symbol} on {exchange_name} to {file_path}")
@@ -484,28 +509,36 @@ class CryptoProvider(BaseDataProvider):
 
             # 2. If no local data or force_reload is True, fetch from exchanges
             self.logger.info(f"Fetching {symbol} from exchanges (force_reload={force_reload}).")
-            symbol_data = []
+            
+            # Fetch from all exchanges in parallel
             tasks = []
             for exchange_name, exchange in self.exchange_instances.items():
-                tasks.append(self._fetch_symbol_from_exchange(exchange, exchange_name, symbol, interval, start_date, end_date))
+                tasks.append(self._fetch_symbol_from_exchange(
+                    exchange, exchange_name, symbol, interval, start_date, end_date
+                ))
             
-            exchange_results = await asyncio.gather(*tasks)
-            for data in exchange_results:
-                symbol_data.extend(data)
-
-            if not symbol_data:
+            # Gather results from all exchanges
+            exchange_dfs = await asyncio.gather(*tasks)
+            
+            # Combine non-empty DataFrames
+            valid_dfs = [df for df in exchange_dfs if not df.empty]
+            
+            if not valid_dfs:
                 results[symbol] = pd.DataFrame()
                 continue
-
-            df = pd.DataFrame([d.to_dict() for d in symbol_data])
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            df = df.drop_duplicates(subset=['timestamp', 'exchange']).set_index('datetime')
-            df_sorted = df.sort_index()
+            
+            # Concatenate all exchange data
+            combined_df = pd.concat(valid_dfs, ignore_index=True)
+            
+            # Set datetime index
+            combined_df['datetime'] = pd.to_datetime(combined_df['timestamp'], unit='ms', utc=True)
+            combined_df = combined_df.drop_duplicates(subset=['timestamp', 'exchange']).set_index('datetime')
+            combined_df = combined_df.sort_index()
             
             # Save the newly fetched data
-            await self.save_to_parquet(df_sorted)
+            await self.save_to_parquet(combined_df)
             
-            results[symbol] = df_sorted
+            results[symbol] = combined_df
         
         return results
     
@@ -527,82 +560,20 @@ class CryptoProvider(BaseDataProvider):
         self.logger.info("Closed all exchange connections")
 
 
-# Example usage and utility functions
-async def example():
-    """Example usage of the CryptoProvider with and without symbol mapping"""
-    # Setup logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+async def main():
+    """Main function to test the CryptoProvider"""
+    provider = CryptoProvider(exchanges=['binance', 'coinbase', 'kraken'], data_dir='data/cryptos')
     
-    print("=" * 60)
-    print("Example 1: Traditional usage (without symbol mapping)")
-    print("=" * 60)
+    symbols = ['BTC/USDT']
+    start_date = datetime(2025, 8, 5, 16, 00, tzinfo=timezone.utc)
+    end_date = datetime(2025, 8, 5, 17, 40, tzinfo=timezone.utc)
+    interval = '1m'
+    force_reload = False
     
-    # Initialize provider without symbol mapping (backward compatible)
-    provider_traditional = CryptoProvider(
-        exchanges=['binance'],
-        data_dir='data/crypto_traditional',
-        use_symbol_mapping=False  # This is the default
-    )
-    
-    try:
-        # Must use exchange-specific format
-        symbols = ['BTCUSDT']  # Binance format
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=1)
-        data_dict = await provider_traditional.fetch_ohlcv(
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-            interval='1h'
-        )
-        print(f"Traditional mode: Fetched data for {symbols}")
-        for symbol, df in data_dict.items():
-            print(f"\n--- Data for {symbol} ---")
-            print(df.head())
-    finally:
-        await provider_traditional.close()
-    
-    print("\n" + "=" * 60)
-    print("Example 2: With unified symbol mapping")
-    print("=" * 60)
-    
-    # Initialize provider with symbol mapping
-    provider_unified = CryptoProvider(
-        exchanges=['binance', 'coinbase', 'kraken'],
-        data_dir='data/crypto_unified',
-        use_symbol_mapping=True
-    )
-    
-    try:
-        # Can use unified format for all exchanges
-        symbols = ['BTC/USDT', 'ETH/USDT']  # Unified format
-        
-        print(f"\nFetching {symbols} from all exchanges using unified format...")
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=1)
-        data_dict = await provider_unified.fetch_ohlcv(
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-            interval='1h'
-        )
-        print(f"Unified mode: Fetched data for {symbols}")
-        for symbol, df in data_dict.items():
-            print(f"\n--- Data for {symbol} ---")
-            print(df.head())
-        
-        # Check health status
-        health = provider_unified.get_health_status()
-        print(f"\nSystem health: {health['overall_healthy']}")
-        print(f"Symbol mapping enabled: {health['symbol_mapping_enabled']}")
-        
-    finally:
-        await provider_unified.close()
+    data = await provider.fetch_ohlcv(symbols, start_date, end_date, interval, force_reload)
+    print(data)
+    await provider.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(example())
-
+    asyncio.run(main())
