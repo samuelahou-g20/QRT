@@ -37,7 +37,7 @@ def mock_databento_client():
 @pytest.fixture
 def sample_1m_data():
     """Generates a sample 1-minute pandas DataFrame."""
-    base_time = int(datetime(2023, 1, 1, 14, 30, tzinfo=timezone.utc).timestamp() * 1e9) # nanoseconds
+    base_time = int(datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc).timestamp() * 1e9) # nanoseconds
     data = []
     for i in range(10): # 10 minutes of data
         ts = base_time + i * 60 * 1_000_000_000
@@ -63,8 +63,8 @@ class TestEquityProvider:
     async def test_fetch_1m_data_from_api(self, provider, mock_databento_client, sample_1m_data):
         """Test fetching 1-minute data directly from the API."""
         symbol = 'AAPL'
-        start_date = datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc)
-        end_date = datetime(2025, 1, 1, 14, 40, tzinfo=timezone.utc)
+        start_date = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+        end_date = datetime(2025, 1, 3, 14, 40, tzinfo=timezone.utc)
 
         # Mock the async API call
         mock_databento_client.timeseries.get_range_async = AsyncMock(return_value=MockDbnStore(sample_1m_data))
@@ -81,8 +81,8 @@ class TestEquityProvider:
     async def test_aggregation_from_1m_to_5m(self, provider, mock_databento_client, sample_1m_data):
         """Test aggregation of 1-minute data to 5-minute intervals."""
         symbol = 'AAPL'
-        start_date = datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc)
-        end_date = datetime(2025, 1, 1, 14, 40, tzinfo=timezone.utc)
+        start_date = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+        end_date = datetime(2025, 1, 2, 14, 40, tzinfo=timezone.utc)
         
         mock_databento_client.timeseries.get_range_async = AsyncMock(return_value=MockDbnStore(sample_1m_data))
 
@@ -104,8 +104,8 @@ class TestEquityProvider:
         """Test that data is saved to and loaded from parquet correctly."""
         symbol = 'MSFT'
         interval = '1m'
-        start_date = datetime(2025, 1, 1, 14, 30, tzinfo=timezone.utc)
-        end_date = datetime(2025, 1, 1, 14, 40, tzinfo=timezone.utc)
+        start_date = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
+        end_date = datetime(2025, 1, 2, 14, 40, tzinfo=timezone.utc)
         
         mock_databento_client.timeseries.get_range_async = AsyncMock(return_value=MockDbnStore(sample_1m_data))
 
