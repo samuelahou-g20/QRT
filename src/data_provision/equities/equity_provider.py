@@ -11,7 +11,7 @@ import pandas as pd
 import os
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from typing import Dict, List, Optional, Union, Any, Tuple
 import logging
 
 from src.data_provision.base_provider import BaseDataProvider
@@ -36,118 +36,13 @@ class EquityProvider(BaseDataProvider):
             data_dir: Directory to store cached Parquet data.
         """
         self.api_key = api_key or os.getenv("DATABENTO_API_KEY")
+        print(self.api_key)
         if not self.api_key:
             raise ValueError("Databento API key not provided or found in DATABENTO_API_KEY environment variable.")
         
         self.client = db.Historical(self.api_key)
         self.data_dir = Path(data_dir)
         self.logger = logging.getLogger(__name__)
-
-
-    async def _get_base_data(self, symbol: str, start_date: datetime, end_date: datetime, interval: str, force_reload: bool) -> pd.DataFrame:
-        """
-        Loads or fetches the base 1-minute data for a given symbol and date range.
-        """
-        if not force_reload:
-            local_df = await self._load_symbol_from_parquet(symbol, start_date, end_date, interval)
-            if not local_df.empty:
-                self.logger.info(f"Loaded {len(local_df)} records for {symbol} from local files.")
-                return local_df
-
-        self.logger.info(f"Fetching {symbol} from Databento (force_reload={force_reload}).")
-        
-        fetched_df = await self._fetch_from_databento(symbol, start_date, end_date, interval)
-        
-        if not fetched_df.empty:
-            # Asynchronously save the newly fetched data
-            asyncio.create_task(self.save_to_parquet(fetched_df.copy(), symbol, interval))
-
-        return fetched_df
-
-    async def _fetch_from_databento(self, symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
-        """
-        Fetches OHLCV data from the Databento API for a given symbol.
-        """
-        try:
-            if start >= end:
-                self.logger.warning(f"Start date {start} is after end date {end}. No data to fetch.")
-                return pd.DataFrame()
-
-            data = await self.client.timeseries.get_range_async(
-                dataset=self.DATASET,
-                symbols=[symbol],
-                schema=f"ohlcv-{interval}",
-                start=start,
-                end=end
-            )
-            df = data.to_df()
-            if df.empty:
-                return pd.DataFrame()
-            
-            # Rename and format columns to be consistent
-            df.reset_index(inplace=True)
-            df.rename(columns={'ts_event': 'timestamp'}, inplace=True)
-            df['timestamp'] = (df['timestamp'].astype('int64') // 1_000_000) # nanoseconds to milliseconds
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            df.set_index('datetime', inplace=True)
-            return df[['open', 'high', 'low', 'close', 'volume']]
-
-        except Exception as e:
-            self.logger.error(f"Error fetching data for {symbol} from Databento: {e}")
-            return pd.DataFrame()
-
-    def _get_file_path(self, symbol: str, date: datetime, interval: str) -> Path:
-        """Generate file path for storing data."""
-        path = (
-            self.data_dir / "ohlcv" / symbol /
-            f"year={date.year}" / f"month={date.month:02d}" / f"day={date.day:02d}"
-        )
-        path.mkdir(parents=True, exist_ok=True)
-        return path / f"{interval}.parquet"
-
-    async def save_to_parquet(self, df: pd.DataFrame, symbol: str, interval: str):
-        """Saves a DataFrame of OHLCV data to partitioned Parquet files by day."""
-        if df.empty or not isinstance(df.index, pd.DatetimeIndex):
-            return
-
-        for day, daily_data in df.groupby(df.index.date):
-            if daily_data.empty:
-                continue
-            
-            file_path = self._get_file_path(symbol, day, interval)
-            try:
-                # Reset index to save datetime as a column
-                data_to_save = daily_data.reset_index()
-                await asyncio.to_thread(
-                    data_to_save.to_parquet, file_path, compression='snappy', index=False
-                )
-                self.logger.info(f"Saved {len(data_to_save)} records to {file_path}")
-            except Exception as e:
-                self.logger.error(f"Failed to save data to {file_path}: {e}")
-
-    async def _load_symbol_from_parquet(self, symbol: str, start_date: datetime, end_date: datetime, interval: str) -> pd.DataFrame:
-        """Loads data for a single symbol from local Parquet files within a date range."""
-        all_dfs = []
-        date_range = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
-
-        for date in date_range:
-            file_path = self._get_file_path(symbol, date, interval)
-            if file_path.exists():
-                try:
-                    df = await asyncio.to_thread(pd.read_parquet, file_path)
-                    all_dfs.append(df)
-                except Exception as e:
-                    self.logger.error(f"Error loading Parquet file {file_path}: {e}")
-        
-        if not all_dfs:
-            return pd.DataFrame()
-
-        combined_df = pd.concat(all_dfs, ignore_index=True)
-        combined_df['datetime'] = pd.to_datetime(combined_df['datetime'], utc=True)
-        combined_df = combined_df.set_index('datetime')
-
-        mask = (combined_df.index >= start_date) & (combined_df.index <= end_date)
-        return combined_df.loc[mask].sort_index()
 
     async def fetch_ohlcv(
         self,
@@ -203,6 +98,189 @@ class EquityProvider(BaseDataProvider):
         return results
 
     @staticmethod
+    def _find_missing_ranges(df: pd.DataFrame, start_req: datetime, end_req: datetime, interval: str) -> List[Tuple[datetime, datetime]]:
+        """Identifies all missing time ranges in a DataFrame, including internal gaps."""
+        if df.empty:
+            return [(start_req, end_req)]
+
+        missing_ranges = []
+        df = df.sort_index()
+        
+        time_delta = pd.to_timedelta(interval)
+
+        # Check for gap before the first data point
+        if df.index[0] > start_req:
+            missing_ranges.append((start_req, df.index[0]))
+
+        # Check for internal gaps by comparing the difference between consecutive timestamps
+        time_diffs = df.index.to_series().diff()
+        
+        # Identify gaps larger than the expected interval (e.g., > 1 minute for 1m data)
+        # We add a small buffer to account for minor timing inconsistencies.
+        gaps = time_diffs[time_diffs > (time_delta * 1.5)]
+        
+        for gap_end, diff in gaps.items():
+            gap_start = gap_end - diff
+            missing_start = gap_start + time_delta
+            missing_end = gap_end
+            if missing_start < missing_end:
+                missing_ranges.append((missing_start, missing_end))
+
+        # Check for gap after the last data point
+        if df.index[-1] < end_req:
+            missing_ranges.append((df.index[-1], end_req))
+
+        return missing_ranges
+
+
+    async def _get_base_data(self, symbol: str, start_date: datetime, end_date: datetime, interval: str, force_reload: bool) -> pd.DataFrame:
+        """
+        Loads and fetches the base 1-minute data, intelligently filling gaps.
+        """
+        if force_reload:
+            self.logger.info(f"Forcing reload for {symbol} from Databento.")
+            fetched_df = await self._fetch_from_databento(symbol, start_date, end_date, interval)
+            if not fetched_df.empty:
+                asyncio.create_task(self.save_to_parquet(fetched_df.copy(), symbol, interval))
+            return fetched_df
+
+        # 1. Load existing data from Parquet files
+        local_df = await self._load_symbol_from_parquet(symbol, start_date, end_date, interval)
+        self.logger.info(f"Loaded {len(local_df)} records for {symbol} from local files.")
+
+        # 2. Identify missing date ranges
+        missing_ranges = self._find_missing_ranges(local_df, start_date, end_date, interval)
+
+        # 3. Fetch data for the identified missing ranges
+        if missing_ranges:
+            self.logger.info(f"Fetching {len(missing_ranges)} missing range(s) for {symbol}: {missing_ranges}")
+            tasks = [self._fetch_from_databento(symbol, start, end, interval) for start, end in missing_ranges]
+            fetched_dfs = await asyncio.gather(*tasks)
+
+            # 4. Save newly fetched data and combine with local data
+            all_dfs = [local_df]
+            for df in fetched_dfs:
+                if not df.empty:
+                    all_dfs.append(df)
+                    asyncio.create_task(self.save_to_parquet(df.copy(), symbol, interval))
+            
+            if not any(not df.empty for df in all_dfs):
+                return pd.DataFrame()
+            
+            combined_df = pd.concat(all_dfs)
+            # Sort and remove any potential duplicates at the seams
+            combined_df = combined_df.sort_index()
+            combined_df = combined_df[~combined_df.index.duplicated(keep='first')]
+            
+            # Final filter to the exact requested range
+            mask = (combined_df.index >= start_date) & (combined_df.index <= end_date)
+            return combined_df.loc[mask]
+
+        else:
+            self.logger.info(f"No missing data for {symbol}. Returning cached data.")
+            return local_df
+
+    async def _fetch_from_databento(self, symbol: str, start: datetime, end: datetime, interval: str) -> pd.DataFrame:
+        """
+        Fetches OHLCV data from the Databento API for a given symbol.
+        """
+        try:
+            if start >= end:
+                self.logger.warning(f"Start date {start} is after end date {end}. No data to fetch.")
+                return pd.DataFrame()
+
+            data = await self.client.timeseries.get_range_async(
+                dataset=self.DATASET,
+                symbols=[symbol],
+                schema=f"ohlcv-{interval}",
+                start=start,
+                end=end+timedelta(seconds=1)
+            )
+            df = data.to_df()
+            if df.empty:
+                return pd.DataFrame()
+                
+            # 'ts_event' is the index, not a column. Reset it to become a column.
+            df.reset_index(inplace=True)
+
+            # Rename and format columns to be consistent
+            df.rename(columns={'ts_event': 'timestamp'}, inplace=True)
+            df['timestamp'] = (df['timestamp'].astype('int64') // 1_000_000) # nanoseconds to milliseconds
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df.set_index('datetime', inplace=True)
+            
+            # Ensure no duplicate columns and return only the OHLCV columns
+            result_df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+            result_df = result_df.loc[:, ~result_df.columns.duplicated()]
+            return result_df
+
+        except Exception as e:
+            self.logger.error(f"Error fetching data for {symbol} from Databento: {e}")
+            return pd.DataFrame()
+
+    def _get_file_path(self, symbol: str, date: datetime, interval: str) -> Path:
+        """Generate file path for storing data."""
+        path = (
+            self.data_dir / "ohlcv" / symbol /
+            f"year={date.year}" / f"month={date.month:02d}" / f"day={date.day:02d}"
+        )
+        path.mkdir(parents=True, exist_ok=True)
+        return path / f"{interval}.parquet"
+
+    async def save_to_parquet(self, df: pd.DataFrame, symbol: str, interval: str):
+        """Saves a DataFrame of OHLCV data to partitioned Parquet files by day."""
+        if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+            return
+
+        for day, daily_data in df.groupby(df.index.date):
+            if daily_data.empty:
+                continue
+            
+            file_path = self._get_file_path(symbol, day, interval)
+            try:
+                # Reset index to save datetime as a column
+                data_to_save = daily_data.reset_index()
+                # Ensure no duplicate columns exist
+                data_to_save = data_to_save.loc[:, ~data_to_save.columns.duplicated()]
+                await asyncio.to_thread(
+                    data_to_save.to_parquet, file_path, compression='snappy', index=False
+                )
+                self.logger.info(f"Saved {len(data_to_save)} records to {file_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to save data to {file_path}: {e}")
+
+    async def _load_symbol_from_parquet(self, symbol: str, start_date: datetime, end_date: datetime, interval: str) -> pd.DataFrame:
+        """Loads data for a single symbol from local Parquet files within a date range."""
+        all_dfs = []
+        date_range = pd.date_range(start=start_date.date(), end=end_date.date(), freq='D')
+
+        for date in date_range:
+            file_path = self._get_file_path(symbol, date, interval)
+            if file_path.exists():
+                try:
+                    df = await asyncio.to_thread(pd.read_parquet, file_path)
+                    all_dfs.append(df)
+                except Exception as e:
+                    self.logger.error(f"Error loading Parquet file {file_path}: {e}")
+        
+        if not all_dfs:
+            return pd.DataFrame()
+
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        # Remove any duplicate columns that might have been created
+        combined_df = combined_df.loc[:, ~combined_df.columns.duplicated()]
+        
+        if 'datetime' not in combined_df.columns:
+             self.logger.error("Loaded parquet file is missing 'datetime' column.")
+             return pd.DataFrame()
+        
+        combined_df['datetime'] = pd.to_datetime(combined_df['datetime'], utc=True)
+        combined_df = combined_df.set_index('datetime')
+
+        mask = (combined_df.index >= start_date) & (combined_df.index <= end_date)
+        return combined_df.loc[mask].sort_index()
+
+    @staticmethod
     def _aggregate_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
         """
         Aggregates 1-minute OHLCV data to a larger interval.
@@ -232,6 +310,7 @@ class EquityProvider(BaseDataProvider):
         self.logger.info("Databento provider closed.")
         pass # Databento client doesn't require explicit closing
 
+
 async def main():
     """Example usage of the EquityProvider."""
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -239,10 +318,10 @@ async def main():
     # The provider will now automatically look for the .env file in your project root
     provider = EquityProvider()
     
-    symbols = ['AAPL', 'MSFT']
+    symbols = ['MSFT']
     
-    start_date = datetime(2025, 1, 2, 14, 30, tzinfo=timezone.utc)
-    end_date = datetime(2025, 1, 2, 14, 40, tzinfo=timezone.utc)
+    start_date = datetime(2025, 8, 5, 16, 00, tzinfo=timezone.utc)
+    end_date = datetime(2025, 8, 5, 17, 40, tzinfo=timezone.utc)
 
     try:
         # Fetch 15-minute aggregated data
