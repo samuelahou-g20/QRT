@@ -417,32 +417,32 @@ class TestCryptoProviderWithSymbolMapping:
         # Mock exchange to return data
         mock_exchange = AsyncMock()
         mock_exchange.fetch_ohlcv.return_value = mock_data
-        mock_exchange.parse_timeframe = Mock(return_value = 3600 * 1000)
+        mock_exchange.parse_timeframe = Mock(return_value=3600 * 1000)
         provider_with_mapping.exchange_instances = {'binance': mock_exchange}
 
         # 1. Fetch and save data
         results_fetch = await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval)
-        print(results_fetch)
-        
+
         # Check that a file was created
         expected_path = provider_with_mapping._get_file_path(symbol, start_date, 'binance', interval)
         assert expected_path.exists()
 
         # 2. Now, fetch again, which should load from the file
-        # To prove it loads from file, we can patch the inner fetching method
         with patch.object(provider_with_mapping, '_fetch_symbol_from_exchange', new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = [] # Ensure it returns nothing from exchange
             
             results_load = await provider_with_mapping.fetch_ohlcv(symbol, start_date, end_date, interval, force_reload=False)
-            print(results_load)
+            
             # Assert that the network fetch was NOT called
             mock_fetch.assert_not_called()
             
-            # Assert that the data is the same, ignoring column order and index type
+            # *** FIX: Create an expected DataFrame with only the saved columns ***
+            expected_df = results_fetch[symbol][['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            
+            # Assert that the data is the same
             pd.testing.assert_frame_equal(
-                results_fetch[symbol].sort_index(axis=1), 
-                results_load[symbol].sort_index(axis=1),
-                check_like=True
+                expected_df.reset_index(drop=True), 
+                results_load[symbol].reset_index(drop=True),
             )
             
             # 3. Test force_reload

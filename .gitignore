@@ -1,0 +1,8 @@
+# Ignore file types
+*.txt
+*.pyc
+*.parquet
+*.csv
+*.json
+*.log
+

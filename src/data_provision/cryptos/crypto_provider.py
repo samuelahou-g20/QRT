@@ -20,10 +20,14 @@ import aiofiles
 import aiolimiter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import hashlib
+import dotenv
 
-from services.data_provision.base_provider import BaseDataProvider
-from services.data_provision.circuit_breaker import CircuitBreaker
-from services.data_provision.ohlcv_data import OHLCVData
+from src.data_provision.base_provider import BaseDataProvider
+from src.data_provision.circuit_breaker import CircuitBreaker
+from src.data_provision.ohlcv_data import OHLCVData
+
+# Load environment variables
+dotenv.load_dotenv()
 
 
 class CryptoProvider(BaseDataProvider):
@@ -75,7 +79,7 @@ class CryptoProvider(BaseDataProvider):
         self.symbol_manager = None
         if use_symbol_mapping:
             try:
-                from services.data_provision.cryptos.symbol_mapper import SymbolManager
+                from src.data_provision.cryptos.symbol_mapper import SymbolManager
                 self.symbol_manager = SymbolManager(symbol_config_path)
                 self.logger = logging.getLogger(__name__)
                 self.logger.info("Symbol mapping enabled")
@@ -160,7 +164,7 @@ class CryptoProvider(BaseDataProvider):
                 return self.symbol_manager.to_exchange(symbol, exchange_name)
             else:
                 # Convert exchange to unified format
-                from services.data_provision.cryptos.symbol_mapper import SymbolType
+                from src.data_provision.cryptos.symbol_mapper import SymbolType
                 return str(self.symbol_manager.to_unified(symbol, exchange_name, SymbolType.SPOT))
         except Exception as e:
             self.logger.debug(f"Symbol conversion failed for {symbol} on {exchange_name}: {e}")
@@ -287,51 +291,40 @@ class CryptoProvider(BaseDataProvider):
         return final_df.sort_index()
 
 
-    async def save_to_parquet(self,
-                        data: Dict[str, List[OHLCVData]],
-                        symbol: str,
-                        timeframe: str,
-                        date: Optional[datetime] = None):
-        """Save OHLCV data to parquet files"""
-        if not date:
-            date = datetime.now()
+    async def save_to_parquet(self, data: pd.DataFrame):
+        """Save OHLCV data to parquet files, partitioned by day."""
+        if data.empty:
+            return
 
-        for exchange_name, ohlcv_list in data.items():
-            if not ohlcv_list:
+        df_to_save = data.copy()
+        # Ensure 'datetime' is the index for Grouper
+        if 'datetime' in df_to_save.columns:
+            df_to_save = df_to_save.set_index('datetime')
+        elif df_to_save.index.name != 'datetime':
+            self.logger.error("DataFrame for saving must have a 'datetime' index or column.")
+            return
+
+        # The DataFrame might contain data for multiple symbols if called directly,
+        # but from fetch_ohlcv it will only contain one.
+        for (exchange_name, symbol, interval), group in df_to_save.groupby(['exchange', 'symbol', 'interval']):
+            if group.empty:
                 continue
 
-            # Convert to DataFrame
-            df_data = [d.to_dict() for d in ohlcv_list]
-            df = pd.DataFrame(df_data)
-
-            if df.empty:
-                continue
-
-            # Convert timestamp to datetime
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-
-            # Sort by timestamp
-            df = df.sort_values('timestamp')
-
-            # Remove duplicates
-            df = df.drop_duplicates(subset=['timestamp'], keep='last')
-
-            # *** FIX: Select only the columns you want to save ***
-            columns_to_save = [
-                'timestamp', 'open', 'high', 'low', 'close', 'volume', 'datetime'
-            ]
-            df_to_save = df[columns_to_save]
-
-
-            # Get file path
-            file_path = self._get_file_path(symbol, date, exchange_name, timeframe)
-
-            try:
-                # Save to parquet with compression
-                df_to_save.to_parquet(file_path, compression='snappy', index=False)
-                self.logger.info(f"Saved {len(df_to_save)} records to {file_path}")
-            except Exception as e:
-                self.logger.error(f"Failed to save data to {file_path}: {e}")
+            # Group by day from the datetime index and save each day's data
+            for date, daily_group in group.groupby(pd.Grouper(freq='D')):
+                if daily_group.empty:
+                    continue
+                
+                file_path = self._get_file_path(symbol, date, exchange_name, interval)
+                
+                try:
+                    # Drop redundant columns before saving
+                    daily_group_to_save = daily_group.drop(columns=['exchange', 'symbol', 'interval'])
+                    # Reset index to save datetime as a column
+                    daily_group_to_save.reset_index().to_parquet(file_path, compression='snappy', index=False)
+                    self.logger.info(f"Saved {len(daily_group)} records for {symbol} on {exchange_name} to {file_path}")
+                except Exception as e:
+                    self.logger.error(f"Failed to save data to {file_path}: {e}")
     
 
     async def get_available_symbols(self, exchange: str, force_refresh: bool = False) -> Set[str]:
